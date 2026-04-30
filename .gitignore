@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# IDE
+.idea/
+.trae/
+*.csproj.user
+
+# Models (binary)
+*.pt
+models/
+easyocr_models/
+paddleocr_models/
+
+# Data / datasets
+datasets/
+dataset_*/
+frames/
+roi_labeled/
+yolo_box_analysis/
+analysis_*/
+enhanced_ocr_results/
+output/
+logs/
+runs/
+tmp_predict_samples/
+
+# Generated media
+*.mp4
+
+# Build artifacts / release
+release/
+packaging/*.exe
+
+# C# build
+csharp/**/bin/
+csharp/**/obj/
+
+# OS
+Thumbs.db
+.DS_Store

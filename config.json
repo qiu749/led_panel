@@ -1,0 +1,20 @@
+{
+  "standard_width": 640,
+  "standard_height": 480,
+  "debounce_frames": 3,
+  "expected_sequence": ["led1", "led2", "led3", "led4", "led5", "led6"],
+  "rois": {
+    "led1": {"x1": 100, "y1": 100, "x2": 200, "y2": 200},
+    "led2": {"x1": 220, "y1": 100, "x2": 320, "y2": 200},
+    "led3": {"x1": 340, "y1": 100, "x2": 440, "y2": 200},
+    "led4": {"x1": 340, "y1": 220, "x2": 440, "y2": 320},
+    "led5": {"x1": 220, "y1": 220, "x2": 320, "y2": 320},
+    "led6": {"x1": 100, "y1": 220, "x2": 200, "y2": 320}
+  },
+  "number_display": {"x1": 460, "y1": 100, "x2": 620, "y2": 300},
+  "expected_number": "88.5",
+  "mock": {
+    "sequence_duration": 100,
+    "all_lit_frame": 80
+  }
+}

@@ -1,0 +1,10 @@
+path: D:\Desktop2\Images\dataset
+train: images/train
+val: images/train
+
+names:
+  0: ledgroup
+  1: ledgroup2
+  2: ledgroup3
+
+nc: 3
