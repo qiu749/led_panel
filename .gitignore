@@ -37,6 +37,12 @@ tmp_predict_samples/
 release/
 packaging/*.exe
 
+# Tools / installers (excluded from worktree diffs)
+tools/
+
+# Claude Code
+.claude/
+
 # C# build
 csharp/**/bin/
 csharp/**/obj/
