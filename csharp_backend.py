@@ -18,6 +18,7 @@ from desktop_app import (
     CV_TEMPLATE_MODEL_DEFAULT,
     MARQUEE_TEMPLATE_MODEL_DEFAULT,
     OUTPUT_DEFAULT,
+    RESOURCE_ROOT,
     ROI_EXPECTED_POINTS,
     CameraInfo,
     HikvisionCameraStream,
@@ -32,6 +33,25 @@ from desktop_app import (
 )
 
 import marquee_inspection as marquee
+import detect_dot_panel as dot_panel
+
+
+# FS-GRMA-JC 白/蓝点阵面板模板（detect_dot_panel.py 的模型）。
+DOT_PANEL_MODEL_DEFAULT = (
+    RESOURCE_ROOT / "models" / "dot_panel" / "Video_20260529135514029" / "templates.json"
+)
+
+# 型号标识：ME70 走 cv_template 逻辑，FS-GRMA-JC 走 detect_dot_panel 逻辑。
+MODEL_ME70 = "ME70"
+MODEL_DOT_PANEL = "FS-GRMA-JC"
+DOT_PANEL_ALIASES = {"FS-GRMA-JC", "FS_GRMA_JC", "FSGRMAJC", "DOT_PANEL", "DOTPANEL"}
+
+
+def normalize_model(value: str) -> str:
+    name = (value or "").strip().upper()
+    if name in DOT_PANEL_ALIASES:
+        return MODEL_DOT_PANEL
+    return MODEL_ME70
 
 
 def json_bytes(payload: dict[str, Any], status: int = 200) -> tuple[int, bytes, str]:
@@ -45,6 +65,7 @@ class InspectionBackend:
         self.cameras: list[CameraInfo] = []
         self.camera_stream: OpenCVCameraStream | HikvisionCameraStream | None = None
         self.template_cache: dict[str, Any] = {}
+        self.dot_panel_model: dict[str, Any] | None = None
         self.logs: list[str] = []
         self.output_dir = OUTPUT_DEFAULT
         self.rotate_180 = False
@@ -191,6 +212,15 @@ class InspectionBackend:
             self.log(f"加载模板: {path}")
             self.template_cache[template_path] = cv_template.load_templates(path)
         return self.template_cache[template_path]
+
+    def get_dot_panel_model(self) -> dict[str, Any]:
+        if self.dot_panel_model is None:
+            path = DOT_PANEL_MODEL_DEFAULT
+            if not path.exists():
+                raise FileNotFoundError(f"FS-GRMA-JC 模板文件不存在: {path}")
+            self.log(f"加载 FS-GRMA-JC 模板: {path}")
+            self.dot_panel_model = json.loads(path.read_text(encoding="utf-8"))
+        return self.dot_panel_model
 
     def capture_frame_sequence(self, frame_count: int, interval_ms: int) -> list[np.ndarray]:
         frames: list[np.ndarray] = []
@@ -523,7 +553,152 @@ class InspectionBackend:
             response["message"] = self.result_message(payload)
             return response
 
-    def detect_marquee(self, duration_seconds: float = 22.0, interval_ms: int = 66) -> dict[str, Any]:
+    def analyze_dot_panel_frame(self, frame: np.ndarray, model: dict[str, Any]) -> dict[str, Any]:
+        roi_data = model["roi"]
+        roi = dot_panel.Roi(roi_data["x"], roi_data["y"], roi_data["w"], roi_data["h"])
+        angle = model.get("angle", 0.0)
+        params = model.get("detection_params", {})
+        templates = model["templates"]
+
+        panel = dot_panel.align_and_crop(frame, roi, angle)
+        detected = dot_panel.detect_all_leds(panel, params)
+
+        best_template = ""
+        best_result: dict[str, Any] | None = None
+        best_score = -1e9
+        for tmpl_key, tmpl_data in templates.items():
+            tmpl_points = [{"x": p["x"], "y": p["y"]} for p in tmpl_data["points"]]
+            result = dot_panel.match_template(detected, tmpl_points, match_radius=30.0)
+            score = result["matched_count"] - result["missing_count"] * 2 - result["extra_count"]
+            if score > best_score:
+                best_score = score
+                best_template = tmpl_key
+                best_result = result
+
+        is_dark = (not best_template) or len(detected) < 3
+        return {
+            "panel": panel,
+            "detected": detected,
+            "best_template": best_template,
+            "best_result": best_result,
+            "is_dark": is_dark,
+            "score": best_score,
+        }
+
+    def draw_dot_panel_result(
+        self,
+        panel: np.ndarray,
+        detected: list[dict[str, float]],
+        best_result: dict[str, Any],
+        tmpl_data: dict[str, Any],
+        ok: bool,
+    ) -> np.ndarray:
+        image = panel.copy()
+        image_width = max(1, image.shape[1])
+        scale = max(0.7, image_width / 1600)
+        thickness = max(2, int(round(image_width / 900)))
+        expected = tmpl_data["expected_count"]
+
+        # 模板期望位置（蓝圈）
+        for pt in tmpl_data["points"]:
+            cv2.circle(image, (int(pt["x"]), int(pt["y"])), 14, (180, 130, 0), 1, cv2.LINE_AA)
+        # 检测到的点（绿圈）
+        for pt in detected:
+            cv2.circle(image, (int(pt["x"]), int(pt["y"])), 8, (0, 255, 0), 2, cv2.LINE_AA)
+        # 缺点（黄叉）
+        for pt in best_result["missing_points"]:
+            cv2.drawMarker(image, (int(pt["x"]), int(pt["y"])), (0, 200, 255), cv2.MARKER_CROSS, 22, 3)
+        # 多点（红圈）
+        for pt in best_result["extra_points"]:
+            cv2.circle(image, (int(pt["x"]), int(pt["y"])), 12, (0, 0, 255), 3, cv2.LINE_AA)
+
+        header_color = (0, 180, 0) if ok else (0, 0, 255)
+        header = (
+            f"{'PASS' if ok else 'NG'}  [{tmpl_data['name']}]  "
+            f"{best_result['matched_count']}/{expected}  "
+            f"缺{best_result['missing_count']} 多{best_result['extra_count']}"
+        )
+        self.draw_label(image, header, 16, int(40 * scale), header_color, scale=max(0.9, scale), thickness=thickness)
+        return image
+
+    def detect_dot_panel(self, frame_count: int = 5, interval_ms: int = 60) -> dict[str, Any]:
+        frame_count = max(1, min(15, frame_count))
+        interval_ms = max(5, min(1000, interval_ms))
+        with self.inference_lock:
+            frames = self.capture_frame_sequence(frame_count, interval_ms)
+            if not frames:
+                raise RuntimeError("没有采集到有效帧")
+            model = self.get_dot_panel_model()
+
+            analyses = [self.analyze_dot_panel_frame(frame, model) for frame in frames]
+            # 优先选择非暗帧中得分最高的一帧；若全暗则取首帧。
+            lit = [item for item in analyses if not item["is_dark"]]
+            pool = lit if lit else analyses
+            best_index = max(range(len(pool)), key=lambda i: pool[i]["score"])
+            best = pool[best_index]
+
+            templates = model["templates"]
+            if best["is_dark"]:
+                payload = {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "model": MODEL_DOT_PANEL,
+                    "overall_ok": False,
+                    "status": "DARK",
+                    "detected_count": len(best["detected"]),
+                    "matched_template": "",
+                    "template_name": "暗帧",
+                    "expected_count": 0,
+                    "matched_count": 0,
+                    "missing_count": 0,
+                    "extra_count": 0,
+                    "ng_count": 1,
+                    "frames_captured": len(frames),
+                }
+                result_image = best["panel"].copy()
+                self.draw_label(result_image, "DARK: 暗帧/未点亮", 16, 40, (0, 200, 255), scale=1.0, thickness=2)
+            else:
+                tmpl_data = templates[best["best_template"]]
+                best_result = best["best_result"]
+                ok = best_result["missing_count"] == 0 and best_result["extra_count"] == 0
+                payload = {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "model": MODEL_DOT_PANEL,
+                    "overall_ok": ok,
+                    "status": "PASS" if ok else "NG",
+                    "detected_count": len(best["detected"]),
+                    "matched_template": best["best_template"],
+                    "template_name": tmpl_data["name"],
+                    "expected_count": tmpl_data["expected_count"],
+                    "matched_count": best_result["matched_count"],
+                    "missing_count": best_result["missing_count"],
+                    "extra_count": best_result["extra_count"],
+                    "ng_count": 0 if ok else 1,
+                    "frames_captured": len(frames),
+                }
+                result_image = self.draw_dot_panel_result(
+                    best["panel"], best["detected"], best_result, tmpl_data, ok
+                )
+
+            run_dir = self.output_dir / datetime.now().strftime("%Y%m%d_%H%M%S_dotpanel_station")
+            frames_dir = run_dir / "frames"
+            for index, frame in enumerate(frames, start=1):
+                write_image(frames_dir / f"frame_{index:02d}.jpg", frame)
+            write_image(run_dir / "result.jpg", result_image)
+            save_json(run_dir / "result.json", payload)
+
+            with self.lock:
+                self.last_result_image = result_image
+                self.last_payload = payload
+                self.last_run_dir = run_dir
+            self.log(
+                f"FS-GRMA-JC 检测完成: {payload['status']} "
+                f"匹配[{payload['template_name']}] {payload['matched_count']}/{payload['expected_count']} "
+                f"缺{payload['missing_count']} 多{payload['extra_count']}"
+            )
+            response = dict(payload)
+            response["run_dir"] = str(run_dir)
+            response["message"] = self.dot_panel_result_message(payload)
+            return response
         with self.inference_lock:
             template_path = Path(MARQUEE_TEMPLATE_MODEL_DEFAULT)
             if not template_path.exists():
@@ -569,6 +744,20 @@ class InspectionBackend:
             return "NG: 检测结果异常"
         first = bad[0]
         return f"NG: {len(bad)} 个组件异常，首个 #{int(first['index']) + 1:02d} 缺点 {len(first.get('missing_slots', []))} 个"
+
+    @staticmethod
+    def dot_panel_result_message(payload: dict[str, Any]) -> str:
+        if payload.get("status") == "DARK":
+            return f"DARK: 暗帧/未点亮（检测 {payload.get('detected_count', 0)} 点）"
+        name = payload.get("template_name", "")
+        matched = payload.get("matched_count", 0)
+        expected = payload.get("expected_count", 0)
+        if payload.get("overall_ok"):
+            return f"PASS: [{name}] {matched}/{expected} 全亮正常"
+        return (
+            f"NG: [{name}] {matched}/{expected} "
+            f"缺{payload.get('missing_count', 0)} 多{payload.get('extra_count', 0)}"
+        )
 
     @staticmethod
     def marquee_result_message(payload: dict[str, Any]) -> str:
@@ -617,7 +806,11 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/stop_preview":
                 self.write_response(*json_bytes(BACKEND.stop_preview()))
             elif path == "/detect":
-                self.write_response(*json_bytes(BACKEND.detect(int(payload.get("frame_count", 7)), int(payload.get("interval_ms", 45)))))
+                model = normalize_model(str(payload.get("model", MODEL_ME70)))
+                if model == MODEL_DOT_PANEL:
+                    self.write_response(*json_bytes(BACKEND.detect_dot_panel(int(payload.get("frame_count", 5)), int(payload.get("interval_ms", 60)))))
+                else:
+                    self.write_response(*json_bytes(BACKEND.detect(int(payload.get("frame_count", 7)), int(payload.get("interval_ms", 45)))))
             else:
                 self.write_response(*json_bytes({"error": "not found"}, status=404))
         except Exception as exc:
