@@ -999,6 +999,10 @@ class DesktopInspectionApp(tk.Tk):
 
         method_frame = ttk.Frame(header)
         method_frame.grid(row=3, column=0, columnspan=5, pady=(10, 0), sticky="ew")
+        ttk.Label(method_frame, text="型号").pack(side="left", padx=(0, 4))
+        self.panel_model_var = tk.StringVar(value="ME70")
+        self.panel_model_combo = ttk.Combobox(method_frame, textvariable=self.panel_model_var, state="readonly", width=14, values=["ME70", "FS-GRMA-JC"])
+        self.panel_model_combo.pack(side="left", padx=(0, 12))
         ttk.Label(method_frame, text="灯点方法").pack(side="left", padx=(0, 8))
         ttk.Radiobutton(method_frame, text="YOLO", value="YOLO", variable=self.point_method_var).pack(side="left")
         ttk.Radiobutton(method_frame, text="传统方法", value="传统方法", variable=self.point_method_var).pack(side="left", padx=(10, 10))
@@ -1338,6 +1342,10 @@ class DesktopInspectionApp(tk.Tk):
         output_dir: str,
     ) -> None:
         try:
+            panel_model = self.panel_model_var.get()
+            if panel_model == "FS-GRMA-JC":
+                self._run_dot_panel_detection(frame, output_dir)
+                return
             with self.inference_lock:
                 result_image, payload, run_dir = self.run_inspection(
                     frame,
@@ -1385,6 +1393,51 @@ class DesktopInspectionApp(tk.Tk):
         for _ in range(3):
             self.after(0, self.bell)
             time.sleep(0.25)
+
+    def _run_dot_panel_detection(self, frame: np.ndarray, output_dir: str) -> None:
+        """FS-GRMA-JC 点阵面板检测。"""
+        from scripts.detect_dot_panel import detect_frame as dot_detect_frame
+        model_path = RESOURCE_ROOT / "models" / "dot_panel" / "Video_20260529135514029" / "templates.json"
+        if not model_path.exists():
+            self.log(f"FS-GRMA-JC 模型不存在: {model_path}")
+            self.after(0, lambda: self.status_var.set("模型文件缺失"))
+            return
+
+        import json
+        model = json.loads(model_path.read_text(encoding="utf-8"))
+        out_dir = Path(output_dir) / f"dot_panel_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        result = dot_detect_frame(frame, model, out_dir, frame_label="live")
+        # 构建结果图
+        roi_data = model["roi"]
+        from scripts.scan_refresh_seven_segment_probe import crop_roi, Roi
+        roi = Roi(roi_data["x"], roi_data["y"], roi_data["w"], roi_data["h"])
+        angle = model.get("angle", 0.0)
+        panel = crop_roi(frame, roi)
+        if abs(angle) >= 0.01:
+            h, w = panel.shape[:2]
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+            panel = cv2.warpAffine(panel, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+
+        # 读取标注图作为显示
+        result_img_path = out_dir / "result_live.jpg"
+        if result_img_path.exists():
+            result_image = cv2.imread(str(result_img_path))
+        else:
+            result_image = panel
+
+        payload = {"overall_ok": result["ok"], "message": result["message"]}
+        self.last_display_frame = result_image
+        self.result_hold_until = time.monotonic() + 5.0
+        self.log(f"FS-GRMA-JC: {result['message']}")
+        alarmed = self.trigger_detection_alarm(payload, "FS-GRMA-JC检测")
+        self.after(0, lambda: self._show_frame(result_image))
+        self.after(0, lambda: self.status_var.set(
+            f"FS-GRMA-JC: {result['status']} {result['template_name']} "
+            f"{result['matched_count']}/{result['expected_count']}"
+            f"{' NG报警' if alarmed else ''}"
+        ))
 
     def build_live_overlay(
         self,

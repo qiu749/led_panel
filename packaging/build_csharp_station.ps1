@@ -6,25 +6,33 @@ Set-Location $root
 
 $publishRoot = Join-Path $root "csharp\LedInspectionStation\bin\Release\net8.0-windows\win-x64\publish"
 $backendDist = Join-Path $root "dist\LedInspectionBackend"
-$stageRoot = Join-Path $root "release\LedInspectionStation_正式版目录"
-$zipPath = Join-Path $root "release\LedInspectionStation_正式版目录.zip"
+$stageRoot = Join-Path $root "release\SevenSegmentStation_trial"
+$zipPath = Join-Path $root "release\SevenSegmentStation_trial.zip"
+
+function Invoke-Checked {
+    param([Parameter(Mandatory=$true)][scriptblock]$Command)
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code $LASTEXITCODE"
+    }
+}
 
 Write-Host "Build C# frontend..."
-dotnet publish .\csharp\LedInspectionStation\LedInspectionStation.csproj -c Release -r win-x64 --self-contained true
+Invoke-Checked { dotnet publish .\csharp\LedInspectionStation\LedInspectionStation.csproj -c Release -r win-x64 --self-contained true --ignore-failed-sources }
 
 Write-Host "Build Python backend..."
-python -m PyInstaller -y .\LedInspectionBackend.spec
+Invoke-Checked { python -m PyInstaller -y .\LedInspectionBackend.spec }
 
 Write-Host "Stage green package..."
 if (Test-Path $stageRoot) {
     Remove-Item -LiteralPath $stageRoot -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $stageRoot | Out-Null
-Copy-Item -LiteralPath "$publishRoot\*" -Destination $stageRoot -Recurse -Force
+Copy-Item -Path (Join-Path $publishRoot "*") -Destination $stageRoot -Recurse -Force
 New-Item -ItemType Directory -Force -Path (Join-Path $stageRoot "backend") | Out-Null
-Copy-Item -LiteralPath "$backendDist\*" -Destination (Join-Path $stageRoot "backend") -Recurse -Force
+Copy-Item -Path (Join-Path $backendDist "*") -Destination (Join-Path $stageRoot "backend") -Recurse -Force
 
-$readme = Get-ChildItem -Path ".\packaging" -Filter "README_*.txt" | Select-Object -First 1
+$readme = Get-Item ".\packaging\README_七段管试产线.txt" -ErrorAction SilentlyContinue
 if ($null -ne $readme) {
     $readmeDest = Join-Path $stageRoot $readme.Name
     if (Test-Path $readmeDest) {

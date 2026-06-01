@@ -25,7 +25,7 @@ binaries += tmp_ret[1]
 hiddenimports += tmp_ret[2]
 
 a = Analysis(
-    ["csharp_backend.py"],
+    ["seven_segment_live_camera_server.py"],
     pathex=[],
     binaries=binaries,
     datas=datas,
