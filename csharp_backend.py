@@ -8,7 +8,7 @@ import traceback
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import cv2
@@ -58,14 +58,86 @@ def json_bytes(payload: dict[str, Any], status: int = 200) -> tuple[int, bytes, 
     return status, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8"
 
 
+class VideoFileStream:
+    def __init__(self, video_path: str, log: Callable[[str], None]) -> None:
+        self.video_path = Path(video_path)
+        self.log = log
+        self.cap: cv2.VideoCapture | None = None
+        self.latest_frame: np.ndarray | None = None
+        self.latest_frame_time = 0.0
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self.camera = CameraInfo(
+            key="video_stream",
+            label=f"视频文件: {self.video_path.name}",
+            kind="video"
+        )
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, name="video-stream-preview", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+    def get_latest_frame(self) -> np.ndarray | None:
+        with self._lock:
+            if self.latest_frame is None:
+                return None
+            return self.latest_frame.copy()
+
+    def _loop(self) -> None:
+        self.log(f"打开视频流: {self.video_path}")
+        cap = cv2.VideoCapture(str(self.video_path))
+        if not cap.isOpened():
+            self.log(f"无法打开视频文件: {self.video_path}")
+            return
+        
+        self.cap = cap
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_delay = 1.0 / fps
+        
+        while not self._stop_event.is_set():
+            started = time.perf_counter()
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+                
+            with self._lock:
+                self.latest_frame = frame.copy()
+                self.latest_frame_time = time.time()
+                
+            elapsed = time.perf_counter() - started
+            sleep_time = max(0.001, frame_delay - elapsed)
+            time.sleep(sleep_time)
+            
+        cap.release()
+        self.cap = None
+        self.log("视频流预览已停止")
+
+
 class InspectionBackend:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.inference_lock = threading.Lock()
         self.cameras: list[CameraInfo] = []
-        self.camera_stream: OpenCVCameraStream | HikvisionCameraStream | None = None
+        self.camera_stream: OpenCVCameraStream | HikvisionCameraStream | VideoFileStream | None = None
         self.template_cache: dict[str, Any] = {}
         self.dot_panel_model: dict[str, Any] | None = None
+        self.dot_panel_pose_cache: dot_panel.PanelPose | None = None
+        self.dot_panel_pose_signature: np.ndarray | None = None
+        self.dot_panel_pose_shape: tuple[int, int] | None = None
         self.logs: list[str] = []
         self.output_dir = OUTPUT_DEFAULT
         self.rotate_180 = False
@@ -128,7 +200,10 @@ class InspectionBackend:
     def configure(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             if "rotate_180" in payload:
-                self.rotate_180 = bool(payload["rotate_180"])
+                rotate_180 = bool(payload["rotate_180"])
+                if rotate_180 != self.rotate_180:
+                    self.rotate_180 = rotate_180
+                    self.clear_dot_panel_pose_cache_locked()
             if "output_dir" in payload and str(payload["output_dir"]).strip():
                 self.output_dir = Path(str(payload["output_dir"]).strip())
         return self.status()
@@ -136,20 +211,36 @@ class InspectionBackend:
     def start_preview(self, camera_label: str = "") -> dict[str, Any]:
         self.stop_preview()
         with self.lock:
-            if not self.cameras:
-                self.refresh_cameras()
-            camera = self.select_camera(camera_label)
-        if camera is None:
-            raise RuntimeError("没有可用相机")
-        stream: OpenCVCameraStream | HikvisionCameraStream
-        if camera.kind == "hikvision":
-            stream = HikvisionCameraStream(camera, self.log)
+            self.clear_dot_panel_pose_cache_locked()
+        
+        is_video = False
+        if camera_label:
+            path_check = Path(camera_label)
+            if path_check.is_file() and path_check.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv", ".wmv"}:
+                is_video = True
+                
+        if is_video:
+            stream = VideoFileStream(camera_label, self.log)
         else:
-            stream = OpenCVCameraStream(camera, self.log)
+            with self.lock:
+                if not self.cameras:
+                    self.refresh_cameras()
+                camera = self.select_camera(camera_label)
+            if camera is None:
+                raise RuntimeError("没有可用相机")
+            stream: OpenCVCameraStream | HikvisionCameraStream | VideoFileStream
+            if camera.kind == "hikvision":
+                stream = HikvisionCameraStream(camera, self.log)
+            else:
+                stream = OpenCVCameraStream(camera, self.log)
+                
         stream.start()
         with self.lock:
             self.camera_stream = stream
-        self.log(f"开始预览: {camera.label}")
+        if is_video:
+            self.log(f"开始视频流预览: {Path(camera_label).name}")
+        else:
+            self.log(f"开始预览: {camera.label}")
         return self.status()
 
     def select_camera(self, label: str) -> CameraInfo | None:
@@ -168,8 +259,14 @@ class InspectionBackend:
             finally:
                 with self.lock:
                     self.camera_stream = None
+                    self.clear_dot_panel_pose_cache_locked()
             self.log("停止预览")
         return self.status()
+
+    def clear_dot_panel_pose_cache_locked(self) -> None:
+        self.dot_panel_pose_cache = None
+        self.dot_panel_pose_signature = None
+        self.dot_panel_pose_shape = None
 
     def orient_frame(self, frame: np.ndarray) -> np.ndarray:
         if self.rotate_180:
@@ -529,38 +626,51 @@ class InspectionBackend:
             frames = self.capture_frame_sequence(frame_count, interval_ms)
             if not frames:
                 raise RuntimeError("没有采集到有效帧")
-            templates = self.get_templates()
-            frame_payloads = [self.analyze_frame(frame, templates) for frame in frames]
-            payload = self.fuse_frames(frame_payloads, templates, frame_count, interval_ms)
-            base_frame = self.choose_base_frame(frames, frame_payloads)
-            result_image = self.draw_operator_result(base_frame, payload, templates)
+            return self.process_me70_frames(frames, frame_count, interval_ms, tag="csharp_station")
 
-            run_dir = self.output_dir / datetime.now().strftime("%Y%m%d_%H%M%S_csharp_station")
-            frames_dir = run_dir / "frames"
-            for index, frame in enumerate(frames, start=1):
-                write_image(frames_dir / f"frame_{index:02d}.jpg", frame)
-            write_image(run_dir / "original.jpg", base_frame)
-            write_image(run_dir / "result.jpg", result_image)
-            save_json(run_dir / "result.json", payload)
+    def process_me70_frames(
+        self,
+        frames: list[np.ndarray],
+        frame_count: int,
+        interval_ms: int,
+        tag: str = "csharp_station",
+    ) -> dict[str, Any]:
+        templates = self.get_templates()
+        frame_payloads = [self.analyze_frame(frame, templates) for frame in frames]
+        payload = self.fuse_frames(frame_payloads, templates, frame_count, interval_ms)
+        base_frame = self.choose_base_frame(frames, frame_payloads)
+        result_image = self.draw_operator_result(base_frame, payload, templates)
 
-            with self.lock:
-                self.last_result_image = result_image
-                self.last_payload = payload
-                self.last_run_dir = run_dir
-            self.log(f"检测完成: {'PASS' if payload['overall_ok'] else 'NG'} ROI={payload['roi_count']}/20 NG={payload['ng_count']}")
-            response = dict(payload)
-            response["run_dir"] = str(run_dir)
-            response["message"] = self.result_message(payload)
-            return response
+        run_dir = self.output_dir / datetime.now().strftime(f"%Y%m%d_%H%M%S_{tag}")
+        frames_dir = run_dir / "frames"
+        for index, frame in enumerate(frames, start=1):
+            write_image(frames_dir / f"frame_{index:02d}.jpg", frame)
+        write_image(run_dir / "original.jpg", base_frame)
+        write_image(run_dir / "result.jpg", result_image)
+        save_json(run_dir / "result.json", payload)
 
-    def analyze_dot_panel_frame(self, frame: np.ndarray, model: dict[str, Any]) -> dict[str, Any]:
-        roi_data = model["roi"]
-        roi = dot_panel.Roi(roi_data["x"], roi_data["y"], roi_data["w"], roi_data["h"])
-        angle = model.get("angle", 0.0)
+        with self.lock:
+            self.last_result_image = result_image
+            self.last_payload = payload
+            self.last_run_dir = run_dir
+        self.log(f"检测完成: {'PASS' if payload['overall_ok'] else 'NG'} ROI={payload['roi_count']}/20 NG={payload['ng_count']}")
+        response = dict(payload)
+        response["run_dir"] = str(run_dir)
+        response["message"] = self.result_message(payload)
+        return response
+
+    def analyze_dot_panel_frame(
+        self,
+        frame: np.ndarray,
+        model: dict[str, Any],
+        pose: dot_panel.PanelPose | None = None,
+    ) -> dict[str, Any]:
         params = model.get("detection_params", {})
         templates = model["templates"]
+        if pose is None:
+            pose = dot_panel.estimate_panel_pose([frame], model)
 
-        panel = dot_panel.align_and_crop(frame, roi, angle)
+        panel = dot_panel.prepare_panel(frame, pose, model)
         detected = dot_panel.detect_all_leds(panel, params)
 
         best_template = ""
@@ -583,6 +693,7 @@ class InspectionBackend:
             "best_result": best_result,
             "is_dark": is_dark,
             "score": best_score,
+            "pose": pose,
         }
 
     def draw_dot_panel_result(
@@ -628,77 +739,194 @@ class InspectionBackend:
             frames = self.capture_frame_sequence(frame_count, interval_ms)
             if not frames:
                 raise RuntimeError("没有采集到有效帧")
-            model = self.get_dot_panel_model()
+            return self.process_dot_panel_frames(frames, tag="dotpanel_station")
 
-            analyses = [self.analyze_dot_panel_frame(frame, model) for frame in frames]
-            # 优先选择非暗帧中得分最高的一帧；若全暗则取首帧。
-            lit = [item for item in analyses if not item["is_dark"]]
-            pool = lit if lit else analyses
-            best_index = max(range(len(pool)), key=lambda i: pool[i]["score"])
-            best = pool[best_index]
+    @staticmethod
+    def dot_panel_scene_signature(image: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, (96, 54), interpolation=cv2.INTER_AREA).astype(np.int16)
 
-            templates = model["templates"]
-            if best["is_dark"]:
-                payload = {
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "model": MODEL_DOT_PANEL,
-                    "overall_ok": False,
-                    "status": "DARK",
-                    "detected_count": len(best["detected"]),
-                    "matched_template": "",
-                    "template_name": "暗帧",
-                    "expected_count": 0,
-                    "matched_count": 0,
-                    "missing_count": 0,
-                    "extra_count": 0,
-                    "ng_count": 1,
-                    "frames_captured": len(frames),
-                }
-                result_image = best["panel"].copy()
-                self.draw_label(result_image, "DARK: 暗帧/未点亮", 16, 40, (0, 200, 255), scale=1.0, thickness=2)
-            else:
-                tmpl_data = templates[best["best_template"]]
-                best_result = best["best_result"]
-                ok = best_result["missing_count"] == 0 and best_result["extra_count"] == 0
-                payload = {
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "model": MODEL_DOT_PANEL,
-                    "overall_ok": ok,
-                    "status": "PASS" if ok else "NG",
-                    "detected_count": len(best["detected"]),
-                    "matched_template": best["best_template"],
-                    "template_name": tmpl_data["name"],
-                    "expected_count": tmpl_data["expected_count"],
-                    "matched_count": best_result["matched_count"],
-                    "missing_count": best_result["missing_count"],
-                    "extra_count": best_result["extra_count"],
-                    "ng_count": 0 if ok else 1,
-                    "frames_captured": len(frames),
-                }
-                result_image = self.draw_dot_panel_result(
-                    best["panel"], best["detected"], best_result, tmpl_data, ok
-                )
+    def dot_panel_scene_changed(self, signature: np.ndarray, frame_shape: tuple[int, int]) -> bool:
+        if self.dot_panel_pose_cache is None or self.dot_panel_pose_signature is None:
+            return True
+        if self.dot_panel_pose_shape != frame_shape:
+            return True
+        diff = float(np.mean(np.abs(signature - self.dot_panel_pose_signature)))
+        return diff > 12.0
 
-            run_dir = self.output_dir / datetime.now().strftime("%Y%m%d_%H%M%S_dotpanel_station")
-            frames_dir = run_dir / "frames"
-            for index, frame in enumerate(frames, start=1):
-                write_image(frames_dir / f"frame_{index:02d}.jpg", frame)
-            write_image(run_dir / "result.jpg", result_image)
-            save_json(run_dir / "result.json", payload)
+    def get_dot_panel_pose(self, frames: list[np.ndarray], model: dict[str, Any]) -> dot_panel.PanelPose:
+        projection = dot_panel.build_max_projection(frames)
+        if projection is None:
+            return dot_panel.estimate_panel_pose(frames, model, refine_template=False)
 
-            with self.lock:
-                self.last_result_image = result_image
-                self.last_payload = payload
-                self.last_run_dir = run_dir
-            self.log(
-                f"FS-GRMA-JC 检测完成: {payload['status']} "
-                f"匹配[{payload['template_name']}] {payload['matched_count']}/{payload['expected_count']} "
-                f"缺{payload['missing_count']} 多{payload['extra_count']}"
+        signature = self.dot_panel_scene_signature(projection)
+        frame_shape = projection.shape[:2]
+        with self.lock:
+            if not self.dot_panel_scene_changed(signature, frame_shape):
+                cached = self.dot_panel_pose_cache
+                if cached is not None:
+                    return dot_panel.PanelPose(cached.roi, cached.angle, f"{cached.source}+cached")
+
+        pose = dot_panel.estimate_panel_pose(frames, model, refine_template=False)
+        self.update_dot_panel_pose_cache(pose, signature, frame_shape)
+        return pose
+
+    def update_dot_panel_pose_cache(
+        self,
+        pose: dot_panel.PanelPose,
+        signature: np.ndarray | None,
+        frame_shape: tuple[int, int] | None,
+    ) -> None:
+        with self.lock:
+            self.dot_panel_pose_cache = pose
+            self.dot_panel_pose_signature = signature.copy() if signature is not None else None
+            self.dot_panel_pose_shape = frame_shape
+
+    def process_dot_panel_frames(
+        self,
+        frames: list[np.ndarray],
+        tag: str = "dotpanel_station",
+    ) -> dict[str, Any]:
+        model = self.get_dot_panel_model()
+        pose = self.get_dot_panel_pose(frames, model)
+        analyses = [self.analyze_dot_panel_frame(frame, model, pose) for frame in frames]
+        # 优先选择非暗帧中得分最高的一帧；若全暗则取首帧。
+        lit = [item for item in analyses if not item["is_dark"]]
+        pool = lit if lit else analyses
+        best_index = max(range(len(pool)), key=lambda i: pool[i]["score"])
+        best = pool[best_index]
+
+        if not best["is_dark"] and (
+            best["best_result"]["missing_count"] > 0 or best["best_result"]["extra_count"] > 0
+        ):
+            projection = dot_panel.build_max_projection(frames)
+            signature = self.dot_panel_scene_signature(projection) if projection is not None else None
+            frame_shape = projection.shape[:2] if projection is not None else None
+            refined_pose = dot_panel.estimate_panel_pose(frames, model, refine_template=True)
+            refined_analyses = [self.analyze_dot_panel_frame(frame, model, refined_pose) for frame in frames]
+            refined_lit = [item for item in refined_analyses if not item["is_dark"]]
+            refined_pool = refined_lit if refined_lit else refined_analyses
+            refined_index = max(range(len(refined_pool)), key=lambda i: refined_pool[i]["score"])
+            refined_best = refined_pool[refined_index]
+            if refined_best["score"] >= best["score"]:
+                pose = refined_pose
+                analyses = refined_analyses
+                lit = refined_lit
+                pool = refined_pool
+                best = refined_best
+                self.update_dot_panel_pose_cache(refined_pose, signature, frame_shape)
+
+        templates = model["templates"]
+        if best["is_dark"]:
+            payload = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "model": MODEL_DOT_PANEL,
+                "overall_ok": False,
+                "status": "DARK",
+                "detected_count": len(best["detected"]),
+                "matched_template": "",
+                "template_name": "暗帧",
+                "expected_count": 0,
+                "matched_count": 0,
+                "missing_count": 0,
+                "extra_count": 0,
+                "ng_count": 1,
+                "frames_captured": len(frames),
+                "pose_source": pose.source,
+                "pose_roi": {"x": pose.roi.x, "y": pose.roi.y, "w": pose.roi.w, "h": pose.roi.h},
+                "pose_angle": float(pose.angle),
+            }
+            result_image = best["panel"].copy()
+            self.draw_label(result_image, "DARK: 暗帧/未点亮", 16, 40, (0, 200, 255), scale=1.0, thickness=2)
+        else:
+            tmpl_data = templates[best["best_template"]]
+            best_result = best["best_result"]
+            ok = best_result["missing_count"] == 0 and best_result["extra_count"] == 0
+            payload = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "model": MODEL_DOT_PANEL,
+                "overall_ok": ok,
+                "status": "PASS" if ok else "NG",
+                "detected_count": len(best["detected"]),
+                "matched_template": best["best_template"],
+                "template_name": tmpl_data["name"],
+                "expected_count": tmpl_data["expected_count"],
+                "matched_count": best_result["matched_count"],
+                "missing_count": best_result["missing_count"],
+                "extra_count": best_result["extra_count"],
+                "ng_count": 0 if ok else 1,
+                "frames_captured": len(frames),
+                "pose_source": pose.source,
+                "pose_roi": {"x": pose.roi.x, "y": pose.roi.y, "w": pose.roi.w, "h": pose.roi.h},
+                "pose_angle": float(pose.angle),
+            }
+            result_image = self.draw_dot_panel_result(
+                best["panel"], best["detected"], best_result, tmpl_data, ok
             )
-            response = dict(payload)
-            response["run_dir"] = str(run_dir)
-            response["message"] = self.dot_panel_result_message(payload)
-            return response
+
+        run_dir = self.output_dir / datetime.now().strftime(f"%Y%m%d_%H%M%S_{tag}")
+        frames_dir = run_dir / "frames"
+        for index, frame in enumerate(frames, start=1):
+            write_image(frames_dir / f"frame_{index:02d}.jpg", frame)
+        write_image(run_dir / "result.jpg", result_image)
+        save_json(run_dir / "result.json", payload)
+
+        with self.lock:
+            self.last_result_image = result_image
+            self.last_payload = payload
+            self.last_run_dir = run_dir
+        self.log(
+            f"FS-GRMA-JC 检测完成: {payload['status']} "
+            f"匹配[{payload['template_name']}] {payload['matched_count']}/{payload['expected_count']} "
+            f"缺{payload['missing_count']} 多{payload['extra_count']}"
+        )
+        response = dict(payload)
+        response["run_dir"] = str(run_dir)
+        response["message"] = self.dot_panel_result_message(payload)
+        return response
+
+    def detect_video(self, path: str, model: str, max_frames: int = 60, stride: int = 5) -> dict[str, Any]:
+        video_path = Path(path)
+        if not path.strip():
+            raise FileNotFoundError("视频文件路径为空")
+        if not video_path.is_file():
+            raise FileNotFoundError(f"视频文件不存在或不是有效文件: {video_path}")
+        frames = self.read_video_frames(video_path, max_frames=max_frames, stride=stride)
+        if not frames:
+            raise RuntimeError(f"无法从视频读取有效帧: {video_path}")
+        self.log(f"视频测试[{model}]: {video_path.name} 抽取 {len(frames)} 帧")
+        with self.inference_lock:
+            if normalize_model(model) == MODEL_DOT_PANEL:
+                response = self.process_dot_panel_frames(frames, tag="dotpanel_video")
+            else:
+                frame_count = len(frames) if len(frames) % 2 == 1 else max(1, len(frames) - 1)
+                response = self.process_me70_frames(frames, frame_count, stride, tag="me70_video")
+        response["source"] = "video"
+        response["video"] = str(video_path)
+        return response
+
+    @staticmethod
+    def read_video_frames(video_path: Path, max_frames: int = 60, stride: int = 5) -> list[np.ndarray]:
+        stride = max(1, int(stride))
+        max_frames = max(1, int(max_frames))
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"无法打开视频: {video_path}")
+        frames: list[np.ndarray] = []
+        index = 0
+        try:
+            while len(frames) < max_frames:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if index % stride == 0:
+                    frames.append(frame)
+                index += 1
+        finally:
+            cap.release()
+        return frames
+
+    def detect_marquee(self, duration_seconds: float = 22.0, interval_ms: int = 66) -> dict[str, Any]:
         with self.inference_lock:
             template_path = Path(MARQUEE_TEMPLATE_MODEL_DEFAULT)
             if not template_path.exists():
@@ -797,6 +1025,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = urlparse(self.path).path
             payload = self.read_json()
+            BACKEND.log(f"POST {path} payload: {payload}")
             if path == "/refresh_cameras":
                 self.write_response(*json_bytes({"cameras": BACKEND.refresh_cameras()}))
             elif path == "/configure":
@@ -811,6 +1040,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.write_response(*json_bytes(BACKEND.detect_dot_panel(int(payload.get("frame_count", 5)), int(payload.get("interval_ms", 60)))))
                 else:
                     self.write_response(*json_bytes(BACKEND.detect(int(payload.get("frame_count", 7)), int(payload.get("interval_ms", 45)))))
+            elif path == "/detect_video":
+                self.write_response(*json_bytes(BACKEND.detect_video(
+                    str(payload.get("path", "")),
+                    str(payload.get("model", MODEL_ME70)),
+                    int(payload.get("max_frames", 60)),
+                    int(payload.get("stride", 5)),
+                )))
             else:
                 self.write_response(*json_bytes({"error": "not found"}, status=404))
         except Exception as exc:

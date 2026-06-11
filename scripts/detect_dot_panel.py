@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -30,6 +31,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cv_pattern_probe import merge_close_points, imwrite_unicode
 from scan_refresh_seven_segment_probe import detect_display_roi, crop_roi, Roi
+
+
+@dataclass
+class PanelPose:
+    roi: Roi
+    angle: float
+    source: str = "model"
 
 
 def detect_all_leds(panel: np.ndarray, params: dict) -> list[dict[str, float]]:
@@ -75,8 +83,140 @@ def detect_all_leds(panel: np.ndarray, params: dict) -> list[dict[str, float]]:
     return merge_close_points(points, mr)
 
 
+def compute_angle(points: list[dict[str, float]]) -> float:
+    if len(points) < 5:
+        return 0.0
+    sorted_pts = sorted(points, key=lambda p: p["y"])
+    rows: list[list[dict[str, float]]] = []
+    current_row = [sorted_pts[0]]
+    for point in sorted_pts[1:]:
+        if point["y"] - current_row[-1]["y"] < 30:
+            current_row.append(point)
+        else:
+            rows.append(current_row)
+            current_row = [point]
+    rows.append(current_row)
+
+    angles: list[float] = []
+    for row in rows:
+        if len(row) < 3:
+            continue
+        xs = np.array([point["x"] for point in row], dtype=np.float32)
+        ys = np.array([point["y"] for point in row], dtype=np.float32)
+        if float(xs.max() - xs.min()) <= 50.0:
+            continue
+        slope = float(np.polyfit(xs, ys, 1)[0])
+        angles.append(float(np.degrees(np.arctan(slope))))
+    return float(np.median(angles)) if angles else 0.0
+
+
+def reference_panel_size(model: dict) -> tuple[int, int]:
+    roi_data = model["roi"]
+    return int(roi_data["w"]), int(roi_data["h"])
+
+
+def _is_reasonable_auto_roi(auto_roi: Roi, model_roi: Roi) -> bool:
+    if auto_roi.w <= 0 or auto_roi.h <= 0:
+        return False
+    width_ratio = auto_roi.w / max(model_roi.w, 1)
+    height_ratio = auto_roi.h / max(model_roi.h, 1)
+    return 0.55 <= width_ratio <= 1.35 and 0.55 <= height_ratio <= 1.35
+
+
+def _recenter_roi_like_model(auto_roi: Roi, model_roi: Roi, frame_shape: tuple[int, ...]) -> Roi:
+    frame_h, frame_w = frame_shape[:2]
+    target_w = min(model_roi.w, frame_w)
+    target_h = min(model_roi.h, frame_h)
+    center_x = auto_roi.x + auto_roi.w / 2.0
+    center_y = auto_roi.y + auto_roi.h / 2.0
+    x = int(round(center_x - target_w / 2.0))
+    y = int(round(center_y - target_h / 2.0))
+    x = max(0, min(x, frame_w - target_w))
+    y = max(0, min(y, frame_h - target_h))
+    return Roi(x=x, y=y, w=target_w, h=target_h)
+
+
+def build_max_projection(frames: list[np.ndarray]) -> np.ndarray | None:
+    projection: np.ndarray | None = None
+    for frame in frames:
+        if frame is None or frame.size == 0:
+            continue
+        if projection is None:
+            projection = frame.copy()
+        else:
+            np.maximum(projection, frame, out=projection)
+    return projection
+
+
+def _shift_roi(base_roi: Roi, dx: int, dy: int, frame_shape: tuple[int, ...]) -> Roi:
+    frame_h, frame_w = frame_shape[:2]
+    w = min(base_roi.w, frame_w)
+    h = min(base_roi.h, frame_h)
+    x = max(0, min(base_roi.x + dx, frame_w - w))
+    y = max(0, min(base_roi.y + dy, frame_h - h))
+    return Roi(x=x, y=y, w=w, h=h)
+
+
+def _score_roi(image: np.ndarray, roi: Roi, angle: float, model: dict) -> float:
+    panel = align_and_crop(image, roi, angle)
+    if panel.size == 0:
+        return -1e9
+    params = model.get("detection_params", {})
+    detected = detect_all_leds(panel, params)
+    best_score = -1e9
+    for tmpl_data in model["templates"].values():
+        result = match_template(detected, tmpl_data["points"], match_radius=30.0)
+        score = result["matched_count"] - result["missing_count"] * 2 - result["extra_count"]
+        if score > best_score:
+            best_score = score
+    return float(best_score)
+
+
+def refine_roi_by_template(image: np.ndarray, anchor_roi: Roi, model: dict, angle: float) -> Roi:
+    best_roi = anchor_roi
+    best_score = _score_roi(image, anchor_roi, angle, model)
+    for dy in range(-48, 49, 8):
+        for dx in range(-120, 121, 12):
+            if dx == 0 and dy == 0:
+                continue
+            candidate = _shift_roi(anchor_roi, dx, dy, image.shape)
+            score = _score_roi(image, candidate, angle, model)
+            if score > best_score:
+                best_score = score
+                best_roi = candidate
+    return best_roi
+
+
+def estimate_panel_pose(frames: list[np.ndarray], model: dict, refine_template: bool = True) -> PanelPose:
+    roi_data = model["roi"]
+    model_roi = Roi(int(roi_data["x"]), int(roi_data["y"]), int(roi_data["w"]), int(roi_data["h"]))
+    model_angle = float(model.get("angle", 0.0))
+    projection = build_max_projection(frames)
+    if projection is None:
+        return PanelPose(roi=model_roi, angle=model_angle, source="model")
+
+    pose_roi = model_roi
+    source = "model"
+    try:
+        auto_roi = detect_display_roi(projection, 40, 0.06)
+        if _is_reasonable_auto_roi(auto_roi, model_roi):
+            pose_roi = _recenter_roi_like_model(auto_roi, model_roi, projection.shape)
+            source = "auto"
+    except Exception:
+        pass
+
+    if refine_template:
+        refined_roi = refine_roi_by_template(projection, pose_roi, model, model_angle)
+        if refined_roi != pose_roi:
+            source = f"{source}+search"
+        pose_roi = refined_roi
+    return PanelPose(roi=pose_roi, angle=model_angle, source=source)
+
+
 def align_and_crop(frame: np.ndarray, roi: Roi, angle: float) -> np.ndarray:
     panel = crop_roi(frame, roi)
+    if panel.size == 0:
+        return panel
     if abs(angle) < 0.01:
         return panel
     h, w = panel.shape[:2]
@@ -84,29 +224,53 @@ def align_and_crop(frame: np.ndarray, roi: Roi, angle: float) -> np.ndarray:
     return cv2.warpAffine(panel, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
 
 
+def prepare_panel(frame: np.ndarray, pose: PanelPose, model: dict) -> np.ndarray:
+    panel = align_and_crop(frame, pose.roi, pose.angle)
+    if panel.size == 0:
+        return panel
+    ref_w, ref_h = reference_panel_size(model)
+    if panel.shape[1] != ref_w or panel.shape[0] != ref_h:
+        panel = cv2.resize(panel, (ref_w, ref_h), interpolation=cv2.INTER_LINEAR)
+    return panel
+
+
 def match_template(detected_points: list[dict[str, float]],
                    template_points: list[dict[str, float]],
                    match_radius: float = 30.0) -> dict:
     """比对检测点和模板点，返回匹配/缺失/多余。"""
-    matched_template = set()
-    matched_detected = set()
+    matched_template: set[int] = set()
+    matched_detected: set[int] = set()
+    suppressed_duplicates: set[int] = set()
+    candidate_radius = max(match_radius + 14.0, match_radius * 1.45)
+    assignments: dict[int, list[tuple[float, int]]] = {}
 
     for di, dp in enumerate(detected_points):
-        best_dist = match_radius
+        best_dist = candidate_radius
         best_ti = -1
         for ti, tp in enumerate(template_points):
-            if ti in matched_template:
-                continue
             dist = ((dp["x"] - tp["x"]) ** 2 + (dp["y"] - tp["y"]) ** 2) ** 0.5
             if dist < best_dist:
                 best_dist = dist
                 best_ti = ti
         if best_ti >= 0:
-            matched_template.add(best_ti)
-            matched_detected.add(di)
+            assignments.setdefault(best_ti, []).append((best_dist, di))
+
+    for ti, candidates in assignments.items():
+        candidates.sort(key=lambda item: item[0])
+        best_dist, best_di = candidates[0]
+        if best_dist <= match_radius:
+            matched_template.add(ti)
+            matched_detected.add(best_di)
+            for duplicate_dist, duplicate_di in candidates[1:]:
+                if duplicate_dist <= candidate_radius:
+                    suppressed_duplicates.add(duplicate_di)
 
     missing = [template_points[i] for i in range(len(template_points)) if i not in matched_template]
-    extra = [detected_points[i] for i in range(len(detected_points)) if i not in matched_detected]
+    extra = [
+        detected_points[i]
+        for i in range(len(detected_points))
+        if i not in matched_detected and i not in suppressed_duplicates
+    ]
 
     return {
         "matched_count": len(matched_template),
@@ -118,16 +282,15 @@ def match_template(detected_points: list[dict[str, float]],
 
 
 def detect_frame(frame: np.ndarray, model: dict, out_dir: Path | None = None,
-                 frame_label: str = "") -> dict:
+                 frame_label: str = "", pose: PanelPose | None = None) -> dict:
     """对单帧做检测，返回结果。"""
-    roi_data = model["roi"]
-    roi = Roi(roi_data["x"], roi_data["y"], roi_data["w"], roi_data["h"])
-    angle = model.get("angle", 0.0)
     params = model.get("detection_params", {})
     templates = model["templates"]
+    if pose is None:
+        pose = estimate_panel_pose([frame], model)
 
-    # ROI + 矫正
-    panel = align_and_crop(frame, roi, angle)
+    # ROI + 矫正 + 归一化到模板坐标系
+    panel = prepare_panel(frame, pose, model)
     
     # 检测亮点
     detected = detect_all_leds(panel, params)
@@ -160,6 +323,9 @@ def detect_frame(frame: np.ndarray, model: dict, out_dir: Path | None = None,
             "missing_count": 0,
             "extra_count": 0,
             "message": f"DARK: 暗帧({len(detected)}点), 跳过",
+            "pose_source": pose.source,
+            "pose_roi": {"x": pose.roi.x, "y": pose.roi.y, "w": pose.roi.w, "h": pose.roi.h},
+            "pose_angle": float(pose.angle),
         }
         return output
 
@@ -178,6 +344,9 @@ def detect_frame(frame: np.ndarray, model: dict, out_dir: Path | None = None,
         "missing_count": best_result["missing_count"],
         "extra_count": best_result["extra_count"],
         "message": f"{'PASS' if ok else 'NG'}: 检测{len(detected)}点, 匹配[{tmpl_data['name']}] {best_result['matched_count']}/{expected}, 缺{best_result['missing_count']} 多{best_result['extra_count']}",
+        "pose_source": pose.source,
+        "pose_roi": {"x": pose.roi.x, "y": pose.roi.y, "w": pose.roi.w, "h": pose.roi.h},
+        "pose_angle": float(pose.angle),
     }
 
     # 画标注图

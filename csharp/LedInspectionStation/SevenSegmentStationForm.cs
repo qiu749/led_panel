@@ -15,6 +15,7 @@ public sealed class SevenSegmentStationForm : Form
 
     private ComboBox cameraCombo = null!;
     private Button startButton = null!;
+    private Button quickStartButton = null!;
     private Button stopButton = null!;
     private Button resetButton = null!;
     private Button ackButton = null!;
@@ -87,6 +88,7 @@ public sealed class SevenSegmentStationForm : Form
         };
         cameraCombo = new ComboBox { Width = 410, DropDownStyle = ComboBoxStyle.DropDownList, Margin = new Padding(0, 8, 8, 0) };
         startButton = MakeButton("开始检测", 112, async (_, _) => await StartDetectionAsync(), Color.FromArgb(37, 99, 235));
+        quickStartButton = MakeButton("快速开始(空格)", 142, async (_, _) => await QuickStartAsync(), Color.FromArgb(22, 163, 74));
         stopButton = MakeButton("停止", 82, async (_, _) => await StopDetectionAsync(), Color.FromArgb(71, 85, 105));
         resetButton = MakeButton("复位", 82, async (_, _) => await ResetDetectionAsync(), Color.FromArgb(71, 85, 105));
         ackButton = MakeButton("确认继续", 112, async (_, _) => await AckAsync(), Color.FromArgb(180, 83, 9));
@@ -106,7 +108,7 @@ public sealed class SevenSegmentStationForm : Form
         videoPathText = new TextBox
         {
             Width = 720,
-            Text = @"C:\Users\Administrator\Videos\518.mp4",
+            Text = @"D:\jiemi\七段管\Video_20260515112415516.avi",
             Margin = new Padding(8, 10, 8, 0)
         };
         chooseVideoButton = MakeButton("选择视频", 112, (_, _) => BrowseVideoFile(), Color.FromArgb(71, 85, 105));
@@ -116,7 +118,7 @@ public sealed class SevenSegmentStationForm : Form
 
         cameraControls.Controls.AddRange(new Control[]
         {
-            MakeCaption("相机"), cameraCombo, startButton, stopButton, resetButton, ackButton,
+            MakeCaption("相机"), cameraCombo, startButton, quickStartButton, stopButton, resetButton, ackButton,
             alarmCheck
         });
 
@@ -421,6 +423,24 @@ public sealed class SevenSegmentStationForm : Form
         RenderStatus(doc.RootElement);
     }
 
+    private async Task QuickStartAsync()
+    {
+        if (!backendReady)
+        {
+            return;
+        }
+
+        quickStartButton.Enabled = false;
+        try
+        {
+            await StartDetectionAsync();
+        }
+        finally
+        {
+            quickStartButton.Enabled = true;
+        }
+    }
+
     private async Task StopDetectionAsync()
     {
         using var doc = await PostJsonAsync("/stop", new { });
@@ -464,7 +484,7 @@ public sealed class SevenSegmentStationForm : Form
 
         videoButton.Enabled = false;
         chooseVideoButton.Enabled = false;
-        SetResult("RUNNING", "正在启动视频实时检测...", Color.FromArgb(37, 99, 235));
+        SetResult("RUNNING", "正在启动视频逐帧快速检测...", Color.FromArgb(37, 99, 235));
         try
         {
             videoPathText.Text = videoPath;
@@ -628,7 +648,8 @@ public sealed class SevenSegmentStationForm : Form
             };
             SetResult(result, string.IsNullOrWhiteSpace(message) ? result : message, color);
         }
-        if (frozen && alarmCheck.Checked && lastResult != result)
+        var alarmResult = result is "NG" or "REVIEW" or "ERROR";
+        if (frozen && alarmResult && alarmCheck.Checked && lastResult != result)
         {
             _ = Task.Run(PlayAlarm);
         }
@@ -780,7 +801,7 @@ public sealed class SevenSegmentStationForm : Form
         if (e.KeyCode == Keys.Space)
         {
             e.Handled = true;
-            await AckAsync();
+            await QuickStartAsync();
         }
         else if (e.KeyCode == Keys.F5)
         {

@@ -47,7 +47,7 @@ from scripts.scan_refresh_seven_segment_probe import Roi, crop_roi, detect_displ
 ROOT = Path(__file__).resolve().parent
 RESOURCE_BASE = RESOURCE_ROOT
 RUNTIME_BASE = RUNTIME_ROOT
-DEFAULT_MODEL = RESOURCE_BASE / "models" / "seven_segment" / "Video_20260520165824830_fine_color" / "templates.json"
+DEFAULT_MODEL = RESOURCE_BASE / "models" / "seven_segment" / "Video_20260515112415516" / "templates.json"
 OUTPUT_ROOT = RUNTIME_BASE / "output"
 
 
@@ -94,7 +94,15 @@ class SevenSegmentLiveBackend:
         self.log(f"已加载全部模板: {len(self.templates)} 个, 序列长度: {len(self.sequence)}")
         self.auto_roi_enabled = True  # 启用自动ROI检测
         self.auto_roi_frames = 300  # 用前N帧做投影来检测ROI (覆盖开头黑帧)
+        self.auto_roi_camera_frames = 120  # 实时相机启动时采样帧数，避免固定旧ROI
+        self.auto_roi_camera_timeout_sec = 4.0
+        self.auto_roi_camera_projection_min_frames = 12
         self.auto_roi_projection_threshold = 40  # 投影阈值
+        self.auto_roi_camera_min_full_bright_ratio = 0.01  # 亮点面积不足时先不跑ROI
+        self.auto_roi_recheck_interval_frames = 20
+        self.auto_roi_recheck_min_iou = 0.70
+        self.auto_roi_recheck_min_center_shift = 0.12
+        self.auto_roi_recheck_min_size_change = 0.20
         self.auto_roi_pad_ratio = 0.06  # ROI边距比例
         self.templates_by_id = {template.id: template for template in self.templates}
         self.template_mask_cache: dict[tuple[str, tuple[int, int]], np.ndarray] = {}
@@ -112,8 +120,14 @@ class SevenSegmentLiveBackend:
         self.expected_min_recall = 0.70
         self.expected_max_extra_ratio_small = 1.8
         self.expected_max_extra_ratio_large = 0.22
+        self.expected_large_template_min_recall = 0.95
+        self.expected_large_template_min_precision = 0.75
+        self.expected_large_template_max_count_ratio = 1.45
         self.expected_small_template_cells = 80
-        self.color_check_enabled = True
+        self.shape_conflict_min_similarity = 0.68
+        self.observed_template_min_similarity = 0.68
+        self.observed_template_buffer_frames = 30
+        self.color_check_enabled = False
         self.expected_min_color_recall = 0.70
         self.global_alignment_enabled = True
         self.global_alignment_min_active_cells = 400
@@ -133,6 +147,9 @@ class SevenSegmentLiveBackend:
         self.quality_min_alignment_score = 0.80
         self.quality_min_trusted_alignment_score = 0.55
         self.quality_frame_stride = 5
+        self.video_offline_sample_fps = 0.0
+        self.video_visual_update_stride = 12
+        self.live_visual_update_stride = 60
         self.roi = self.load_default_roi()
         self.template_matrix = np.vstack([bit_string_to_vector(t.bits) for t in self.templates])
         self.template_on_counts = self.template_matrix.sum(axis=1)
@@ -162,6 +179,8 @@ class SevenSegmentLiveBackend:
         self._last_quality_template_id = ""
         self._detect_frames_window = 0
         self._detect_window_started = time.perf_counter()
+        self._roi_recheck_counter = 0
+        self.observed_template_buffer: list[tuple[int, str, float, str]] = []
         self.refresh_cameras()
 
     def filter_unstable_keyframes(self, templates: list[Template], sequence: list[str]) -> tuple[list[Template], list[str], list[str]]:
@@ -318,6 +337,142 @@ class SevenSegmentLiveBackend:
             self.log(f"自动ROI检测异常: {exc}, 回退模型ROI")
             return None
 
+    def detect_roi_from_stream(self, stream: OpenCVCameraStream | HikvisionCameraStream) -> Roi | None:
+        """实时相机启动时用第一张有效全量画面自动检测显示面板ROI。
+
+        导入视频已经会在检测前自动找ROI；实时相机如果直接使用模型默认ROI，
+        产线机位轻微变化时会从错误区域裁剪，导致模板匹配始终对不上。
+        """
+        if not self.auto_roi_enabled:
+            return None
+        try:
+            frames_read = 0
+            bright_frames = 0
+            last_frame_time = 0.0
+            last_reject_reason = ""
+            max_proj: np.ndarray | None = None
+            deadline = time.perf_counter() + self.auto_roi_camera_timeout_sec
+            while frames_read < self.auto_roi_camera_frames and time.perf_counter() < deadline:
+                frame_time = float(getattr(stream, "latest_frame_time", 0.0) or 0.0)
+                if frame_time <= 0 or frame_time == last_frame_time:
+                    time.sleep(0.02)
+                    continue
+                frame = stream.get_latest_frame()
+                last_frame_time = frame_time
+                if frame is None:
+                    time.sleep(0.02)
+                    continue
+                frames_read += 1
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                bright = gray > self.auto_roi_projection_threshold
+                bright_ratio = float(np.count_nonzero(bright)) / float(gray.size)
+                if bright_ratio < self.auto_roi_camera_min_full_bright_ratio:
+                    last_reject_reason = f"等待全亮帧 bright={bright_ratio:.2%}"
+                    continue
+                bright_frames += 1
+                h, w = frame.shape[:2]
+                if max_proj is None:
+                    max_proj = frame.copy()
+                else:
+                    np.maximum(max_proj, frame, out=max_proj)
+                roi = detect_display_roi(frame, self.auto_roi_projection_threshold, self.auto_roi_pad_ratio)
+                if roi.w >= 100 and roi.h >= 100 and roi.w <= w * 0.95 and roi.h <= h * 0.95:
+                    self.log(f"实时相机自动ROI检测成功: x={roi.x}, y={roi.y}, w={roi.w}, h={roi.h} (第{frames_read}帧全量画面)")
+                    return roi
+                last_reject_reason = f"单帧ROI不稳定({roi.w}x{roi.h})"
+                if bright_frames < self.auto_roi_camera_projection_min_frames or max_proj is None:
+                    continue
+                roi = detect_display_roi(max_proj, self.auto_roi_projection_threshold, self.auto_roi_pad_ratio)
+                if roi.w < 100 or roi.h < 100:
+                    last_reject_reason = f"投影ROI太小({roi.w}x{roi.h})"
+                    continue
+                if roi.w > w * 0.95 and roi.h > h * 0.95:
+                    last_reject_reason = f"投影ROI覆盖全画面({roi.w}x{roi.h})"
+                    continue
+                self.log(f"实时相机自动ROI检测成功: x={roi.x}, y={roi.y}, w={roi.w}, h={roi.h} (有效亮帧投影{bright_frames}帧)")
+                return roi
+            reason = f": {last_reject_reason}" if last_reject_reason else ""
+            self.log(f"实时相机未找到有效全量画面{reason}，回退模型ROI")
+            return None
+        except Exception as exc:
+            self.log(f"实时相机自动ROI检测异常: {exc}, 回退模型ROI")
+            return None
+
+    @staticmethod
+    def roi_iou(a: Roi, b: Roi) -> float:
+        ax2, ay2 = a.x + a.w, a.y + a.h
+        bx2, by2 = b.x + b.w, b.y + b.h
+        ix1, iy1 = max(a.x, b.x), max(a.y, b.y)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        intersection = iw * ih
+        union = a.w * a.h + b.w * b.h - intersection
+        return intersection / max(union, 1)
+
+    def roi_changed_significantly(self, current: Roi, candidate: Roi) -> tuple[bool, str]:
+        iou = self.roi_iou(current, candidate)
+        current_cx, current_cy = current.x + current.w / 2.0, current.y + current.h / 2.0
+        candidate_cx, candidate_cy = candidate.x + candidate.w / 2.0, candidate.y + candidate.h / 2.0
+        center_shift = (
+            ((current_cx - candidate_cx) ** 2 + (current_cy - candidate_cy) ** 2) ** 0.5
+            / max(current.w, current.h, candidate.w, candidate.h, 1)
+        )
+        size_change = max(
+            abs(candidate.w - current.w) / max(current.w, 1),
+            abs(candidate.h - current.h) / max(current.h, 1),
+        )
+        changed = (
+            iou < self.auto_roi_recheck_min_iou
+            or center_shift > self.auto_roi_recheck_min_center_shift
+            or size_change > self.auto_roi_recheck_min_size_change
+        )
+        reason = f"iou={iou:.2f} shift={center_shift:.2%} size={size_change:.2%}"
+        return changed, reason
+
+    def maybe_recalculate_stream_roi(self, frame: np.ndarray) -> None:
+        if not self.auto_roi_enabled or self.video_source:
+            return
+        self._roi_recheck_counter += 1
+        if self._roi_recheck_counter < self.auto_roi_recheck_interval_frames:
+            return
+        self._roi_recheck_counter = 0
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        bright_ratio = float(np.count_nonzero(gray > self.auto_roi_projection_threshold)) / float(gray.size)
+        if bright_ratio < self.auto_roi_camera_min_full_bright_ratio:
+            return
+
+        try:
+            candidate = detect_display_roi(frame, self.auto_roi_projection_threshold, self.auto_roi_pad_ratio)
+        except Exception as exc:
+            self.log(f"实时相机重算ROI失败: {exc}")
+            return
+
+        h, w = frame.shape[:2]
+        if candidate.w < 100 or candidate.h < 100:
+            return
+        if candidate.w > w * 0.95 and candidate.h > h * 0.95:
+            return
+
+        current = Roi(
+            max(0, min(self.roi.x, w - 1)),
+            max(0, min(self.roi.y, h - 1)),
+            max(10, min(self.roi.w, w - self.roi.x)),
+            max(10, min(self.roi.h, h - self.roi.y)),
+        )
+        changed, reason = self.roi_changed_significantly(current, candidate)
+        sequence_finished = self.state.ordered_hits >= len(self.sequence)
+        if sequence_finished:
+            return
+        if not changed:
+            return
+
+        self.roi = candidate
+        self.global_warp = None
+        self.global_warp_score = 0.0
+        self.global_warp_template_id = ""
+        self.log(f"实时相机画面变化，更新ROI: x={candidate.x}, y={candidate.y}, w={candidate.w}, h={candidate.h} {reason}")
+
     def log(self, message: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {message}"
         with self.lock:
@@ -370,13 +525,19 @@ class SevenSegmentLiveBackend:
         else:
             stream = OpenCVCameraStream(camera, self.log)
         stream.start()
+        auto_roi = self.detect_roi_from_stream(stream)
         with self.lock:
             self.stream = stream
+            if auto_roi is not None:
+                self.roi = auto_roi
+            else:
+                self.roi = self.load_default_roi()
             self.video_source = ""
             self.sequence_only_video = True
             self.detecting = True
             self.frozen = False
             self.state = DetectionState(result="RUNNING")
+            self.clear_observed_templates()
             self.global_warp = None
             self.global_warp_score = 0.0
             self.global_warp_template_id = ""
@@ -501,6 +662,12 @@ class SevenSegmentLiveBackend:
         if sim2 > sim:
             return tmpl2, sim2, "below_threshold"
         return tmpl, sim, "below_threshold"
+
+    def fast_bits_from_crop(self, crop: np.ndarray) -> tuple[np.ndarray, int]:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        active = gray > self.active_threshold
+        small = cv2.resize(active.astype(np.uint8) * 255, (self.grid_cols, self.grid_rows), interpolation=cv2.INTER_AREA)
+        return small.reshape(-1) >= self.cell_threshold, int(np.count_nonzero(active))
 
     def maybe_establish_global_alignment(self, crop: np.ndarray, bits: np.ndarray, active_cells: int) -> None:
         if not self.global_alignment_enabled or self.global_warp is not None:
@@ -637,8 +804,24 @@ class SevenSegmentLiveBackend:
             if color_score is not None:
                 return expected_id, float(min(score, color_score)), f"expected_aligned recall={recall:.2f} extra={extra_ratio:.2f} color={color_score:.2f}"
             return expected_id, float(score), f"expected_aligned recall={recall:.2f} extra={extra_ratio:.2f}"
-        # 位置无关匹配：对小模板，当固定位置匹配失败时，用滑动窗口形状匹配
+        if (
+            expected_count >= self.expected_small_template_cells
+            and recall >= self.expected_large_template_min_recall
+            and precision >= self.expected_large_template_min_precision
+            and actual_count <= expected_count * self.expected_large_template_max_count_ratio
+        ):
+            return expected_id, float(min(recall, precision)), (
+                f"expected_large recall={recall:.2f} precision={precision:.2f} "
+                f"extra={extra_ratio:.2f}"
+            )
         if expected_count < self.expected_small_template_cells and actual_count > 0:
+            conflicting_template, conflicting_similarity, conflicting_mode = self.match_bits(bits)
+            conflicting_id = conflicting_template.id if conflicting_template is not None else ""
+            if conflicting_id and conflicting_id != expected_id and conflicting_similarity >= self.shape_conflict_min_similarity:
+                return "", float(score), (
+                    f"expected_reject shape_conflict={conflicting_id} "
+                    f"sim={conflicting_similarity:.2f} mode={conflicting_mode}"
+                )
             shape_score, shape_mode = self._position_invariant_match(expected, bits, expected_count, actual_count)
             if shape_score >= 0.60:
                 return expected_id, float(shape_score), shape_mode
@@ -646,10 +829,8 @@ class SevenSegmentLiveBackend:
 
     def _position_invariant_match(self, expected: np.ndarray, actual: np.ndarray,
                                    expected_count: int, actual_count: int) -> tuple[float, str]:
-        """对小模板进行位置无关的形状匹配：提取模板和实际帧的亮点 bounding box，滑动比较"""
         eg = expected.reshape(self.grid_rows, self.grid_cols)
         ag = actual.reshape(self.grid_rows, self.grid_cols)
-        # 提取模板亮点的 bounding box 区域
         e_rows, e_cols = np.where(eg)
         if len(e_rows) == 0:
             return 0.0, "shape_no_template"
@@ -657,7 +838,6 @@ class SevenSegmentLiveBackend:
         e_c0, e_c1 = int(e_cols.min()), int(e_cols.max()) + 1
         e_patch = eg[e_r0:e_r1, e_c0:e_c1]
         ph, pw = e_patch.shape
-        # 提取实际帧亮点的 bounding box（带 padding）
         a_rows, a_cols = np.where(ag)
         if len(a_rows) == 0:
             return 0.0, "shape_no_actual"
@@ -665,10 +845,8 @@ class SevenSegmentLiveBackend:
         a_r1 = min(self.grid_rows, int(a_rows.max()) + 1 + ph)
         a_c0 = max(0, int(a_cols.min()) - pw)
         a_c1 = min(self.grid_cols, int(a_cols.max()) + 1 + pw)
-        # 限制搜索范围：如果实际帧亮点数量和模板差太多，不太可能匹配
         if actual_count > expected_count * 5 or actual_count < expected_count * 0.3:
             return 0.0, "shape_count_mismatch"
-        # 滑动窗口匹配
         best_score = 0.0
         best_dr, best_dc = 0, 0
         search_region = ag[a_r0:a_r1, a_c0:a_c1]
@@ -688,6 +866,38 @@ class SevenSegmentLiveBackend:
         if best_score >= 0.60:
             return best_score, f"shape_match iou={best_score:.2f} at=({best_dr},{best_dc})"
         return best_score, f"shape_reject iou={best_score:.2f}"
+
+    def clear_observed_templates(self) -> None:
+        self.observed_template_buffer.clear()
+
+    def prune_observed_templates(self) -> None:
+        cutoff = self.state.frames - self.observed_template_buffer_frames
+        if cutoff <= 0:
+            return
+        self.observed_template_buffer = [
+            item for item in self.observed_template_buffer if item[0] >= cutoff
+        ]
+
+    def record_observed_template(self, template_id: str, similarity: float, mode: str) -> None:
+        if not template_id or mode.endswith("below_threshold"):
+            return
+        if similarity < self.observed_template_min_similarity:
+            return
+        self.prune_observed_templates()
+        self.observed_template_buffer.append((self.state.frames, template_id, float(similarity), mode))
+
+    def consume_observed_template(self, expected_id: str) -> tuple[str, float, str]:
+        if not expected_id:
+            return "", 0.0, ""
+        self.prune_observed_templates()
+        for index in range(len(self.observed_template_buffer) - 1, -1, -1):
+            frame_no, template_id, similarity, mode = self.observed_template_buffer[index]
+            if template_id != expected_id:
+                continue
+            del self.observed_template_buffer[index]
+            age = max(0, self.state.frames - frame_no)
+            return template_id, similarity, f"observed_buffer age={age} mode={mode}"
+        return "", 0.0, ""
 
     def accept_template(self, template_id: str) -> str:
         state = self.state
@@ -742,30 +952,52 @@ class SevenSegmentLiveBackend:
             return self._process_latest_frame()
 
     def _process_latest_frame(self) -> dict[str, Any]:
-        frame = self.latest_frame()
+        stream = self.stream
+        frame = stream.get_next_frame() if stream is not None and hasattr(stream, "get_next_frame") else self.latest_frame()
         if frame is None:
-            return {"ok": False, "message": "没有实时帧", **self.status()}
-        return self._process_frame(frame)
+            return {**self.status(), "ok": False, "message": "没有实时帧"}
+        next_processed = self.state.frames + 1
+        update_visuals = next_processed == 1 or next_processed % self.live_visual_update_stride == 0
+        return self._process_frame(frame, update_visuals=update_visuals, event_visuals=True)
 
-    def _process_frame(self, frame: np.ndarray) -> dict[str, Any]:
+    def _process_frame(self, frame: np.ndarray, update_visuals: bool = True, event_visuals: bool = False) -> dict[str, Any]:
+        self.maybe_recalculate_stream_roi(frame)
         roi = self.roi
         h, w = frame.shape[:2]
         roi = Roi(max(0, min(roi.x, w - 1)), max(0, min(roi.y, h - 1)), max(10, min(roi.w, w - roi.x)), max(10, min(roi.h, h - roi.y)))
         self.roi = roi
         crop = crop_roi(frame, roi)
-        mask = make_mask(crop, self.active_threshold)
-        bits = mask_to_vector(mask, self.grid_cols, self.grid_rows, self.cell_threshold)
+        fast_live_frame = self.sequence_only_video and not self.video_source and not update_visuals
+        mask: np.ndarray | None = None
+        aligned_mask: np.ndarray | None = None
+        if fast_live_frame:
+            bits, active_pixels = self.fast_bits_from_crop(crop)
+        else:
+            mask = make_mask(crop, self.active_threshold)
+            bits = mask_to_vector(mask, self.grid_cols, self.grid_rows, self.cell_threshold)
+            active_pixels = int(np.count_nonzero(mask))
         active_cells = int(np.count_nonzero(bits))
-        self.maybe_establish_global_alignment(crop, bits, active_cells)
-        aligned_crop = self.apply_global_alignment(crop)
-        aligned_mask = make_mask(aligned_crop, self.active_threshold)
-        aligned_bits = mask_to_vector(aligned_mask, self.grid_cols, self.grid_rows, self.cell_threshold)
-        aligned_color_bits, aligned_color_counts = mask_to_color_bits(aligned_crop, aligned_mask, self.grid_cols, self.grid_rows, self.cell_threshold)
+        live_sequence_mode = self.sequence_only_video and not self.video_source
+        use_global_alignment = self.global_alignment_enabled and (bool(self.video_source) or live_sequence_mode)
+        if use_global_alignment:
+            self.maybe_establish_global_alignment(crop, bits, active_cells)
+        if use_global_alignment and (self.video_source or live_sequence_mode):
+            aligned_crop = self.apply_global_alignment(crop)
+        else:
+            aligned_crop = crop
+        if fast_live_frame and not live_sequence_mode:
+            aligned_bits, aligned_active_pixels = self.fast_bits_from_crop(aligned_crop)
+        else:
+            aligned_mask = make_mask(aligned_crop, self.active_threshold)
+            aligned_bits = mask_to_vector(aligned_mask, self.grid_cols, self.grid_rows, self.cell_threshold)
+            aligned_active_pixels = int(np.count_nonzero(aligned_mask))
+        if self.color_check_enabled:
+            if aligned_mask is None:
+                aligned_mask = make_mask(aligned_crop, self.active_threshold)
+            aligned_color_bits, aligned_color_counts = mask_to_color_bits(aligned_crop, aligned_mask, self.grid_cols, self.grid_rows, self.cell_threshold)
+        else:
+            aligned_color_bits, aligned_color_counts = "", {}
         aligned_active_cells = int(np.count_nonzero(aligned_bits))
-        aligned_active_pixels = int(np.count_nonzero(aligned_mask))
-        frame_preview = self.draw_roi(frame.copy(), roi)
-        roi_preview = aligned_crop.copy()
-        mask_preview = self.actual_mask_overlay(aligned_crop, aligned_mask, status="mask")
 
         state = self.state
         state.frames += 1
@@ -780,8 +1012,11 @@ class SevenSegmentLiveBackend:
         best_similarity = 0.0
         best_mode = ""
         if aligned_active_cells >= self.min_active_cells:
-            best_tmpl, best_similarity, best_mode = self.match_bits(aligned_bits)
-            best_template_id = best_tmpl.id if best_tmpl is not None else ""
+            if self.sequence_only_video or not fast_live_frame:
+                best_tmpl, best_similarity, best_mode = self.match_bits(aligned_bits)
+                best_template_id = best_tmpl.id if best_tmpl is not None else ""
+                if self.sequence_only_video:
+                    self.record_observed_template(best_template_id, best_similarity, best_mode)
             if self.sequence_only_video:
                 template_id, similarity, mode = self.expected_match(aligned_bits, expected_before_id, aligned_color_bits, aligned_active_pixels)
                 if not template_id and state.cursor == 0 and self.sequence:
@@ -792,6 +1027,14 @@ class SevenSegmentLiveBackend:
                             best_sync = (cand_id, cand_sim, cand_mode)
                     if best_sync[0]:
                         template_id, similarity, mode = best_sync
+                if not template_id:
+                    template_id, similarity, mode = self.consume_observed_template(expected_before_id)
+                if template_id and not mode.endswith("below_threshold"):
+                    best_template_id, best_similarity, best_mode = template_id, similarity, mode
+                else:
+                    if fast_live_frame and not best_template_id:
+                        best_similarity = similarity
+                        best_mode = mode
             else:
                 template_id, similarity, mode = best_template_id, best_similarity, best_mode
             if template_id and not mode.endswith("below_threshold"):
@@ -811,18 +1054,26 @@ class SevenSegmentLiveBackend:
         state.last_status = status
         self.last_quality_overlay = None
         quality = self.empty_quality("unchecked")
-        should_check_quality = status == "matched" and template_id and message != "重复帧"
+        should_check_quality = (
+            status == "matched"
+            and template_id
+            and message != "重复帧"
+            and not live_sequence_mode
+        )
         if should_check_quality:
+            if aligned_mask is None:
+                aligned_mask = make_mask(aligned_crop, self.active_threshold)
             self._quality_matched_counter += 1
-            quality = self.inspect_lit_quality(aligned_crop, aligned_mask, template_id)
+            quality = self.inspect_lit_quality(aligned_crop, aligned_mask, template_id, update_overlay=update_visuals)
             self._last_quality_template_id = template_id
         coverage = state.ordered_hits / max(len(self.sequence), 1)
         sequence_only_video = self.sequence_only_video
+        sequence_complete = state.ordered_hits >= len(self.sequence)
         if sequence_only_video:
             if status == "unknown":
                 message = "非关键帧，等待下一个关键模板"
-            elif not self.video_source and coverage >= self.min_ordered_coverage and status == "matched":
-                message = "关键帧时序已覆盖，继续播放复核"
+            elif not self.video_source and sequence_complete and status == "matched":
+                message = "检测完成，按空格快速开始下一轮"
             if self.video_source:
                 state.result = "RUNNING"
                 self.frozen = False
@@ -834,9 +1085,9 @@ class SevenSegmentLiveBackend:
                 state.result = "REVIEW"
                 self.frozen = False
                 message = quality["message"]
-            elif coverage >= self.min_ordered_coverage:
+            elif sequence_complete:
                 state.result = "PASS"
-                self.frozen = False
+                self.frozen = True
             else:
                 state.result = "RUNNING"
                 self.frozen = False
@@ -855,10 +1106,8 @@ class SevenSegmentLiveBackend:
             self.frozen = True
         else:
             state.result = "RUNNING"
-        diff_preview = self.last_quality_overlay if self.last_quality_overlay is not None else self.actual_mask_overlay(aligned_crop, aligned_mask, status=status)
         expected_after_id = self.next_expected_template_id()
         display_template_id = template_id if status == "matched" and template_id else expected_before_id
-        template_preview = self.render_template_image(display_template_id) if display_template_id else None
         self.update_detection_fps()
 
         payload = {
@@ -897,12 +1146,23 @@ class SevenSegmentLiveBackend:
             "roi": {"x": roi.x, "y": roi.y, "w": roi.w, "h": roi.h},
             "logs": self.logs[-60:],
         }
+        should_update_visuals = update_visuals or (
+            event_visuals and quality["status"] in {"review", "ng"}
+        )
         with self.lock:
-            self.last_frame = frame_preview
-            self.last_roi = roi_preview
-            self.last_mask_preview = mask_preview
-            self.last_diff_preview = diff_preview
-            self.last_template_preview = template_preview
+            if should_update_visuals:
+                if aligned_mask is None:
+                    aligned_mask = make_mask(aligned_crop, self.active_threshold)
+                frame_preview = self.draw_roi(frame.copy(), roi)
+                roi_preview = aligned_crop.copy()
+                mask_preview = self.actual_mask_overlay(aligned_crop, aligned_mask, status="mask")
+                diff_preview = self.last_quality_overlay if self.last_quality_overlay is not None else self.actual_mask_overlay(aligned_crop, aligned_mask, status=status)
+                template_preview = self.render_template_image(display_template_id) if display_template_id else None
+                self.last_frame = frame_preview
+                self.last_roi = roi_preview
+                self.last_mask_preview = mask_preview
+                self.last_diff_preview = diff_preview
+                self.last_template_preview = template_preview
             self.last_bits = bits.copy()
             self.last_payload = payload
         return payload
@@ -1013,7 +1273,13 @@ class SevenSegmentLiveBackend:
                 max_area = max(max_area, area)
         return kept, max_area
 
-    def inspect_lit_quality(self, crop: np.ndarray, actual_mask: np.ndarray, template_id: str) -> dict[str, Any]:
+    def inspect_lit_quality(
+        self,
+        crop: np.ndarray,
+        actual_mask: np.ndarray,
+        template_id: str,
+        update_overlay: bool = True,
+    ) -> dict[str, Any]:
         if not self.quality_enabled:
             return self.empty_quality("off")
         expected_mask = self.load_template_mask(template_id, actual_mask.shape)
@@ -1025,7 +1291,8 @@ class SevenSegmentLiveBackend:
             if alignment_score < self.quality_min_trusted_alignment_score:
                 quality = self.empty_quality("unchecked")
                 quality["message"] = f"质量未检: 配准分数低 {alignment_score:.2f}"
-                self.last_quality_overlay = self.quality_overlay(crop, expected_mask, actual_mask, np.zeros_like(actual_mask), np.zeros_like(actual_mask), "unchecked")
+                if update_overlay:
+                    self.last_quality_overlay = self.quality_overlay(crop, expected_mask, actual_mask, np.zeros_like(actual_mask), np.zeros_like(actual_mask), "unchecked")
                 return quality
             if alignment_score >= self.quality_min_alignment_score:
                 crop = warp_to_reference(crop, warp)
@@ -1066,7 +1333,8 @@ class SevenSegmentLiveBackend:
             status = "review"
             message = f"亮段质量复核: 缺失{missing_ratio:.1%} 最大缺口{max_missing}px"
 
-        self.last_quality_overlay = self.quality_overlay(crop, expected_mask, actual_mask, missing, extra, status)
+        if update_overlay:
+            self.last_quality_overlay = self.quality_overlay(crop, expected_mask, actual_mask, missing, extra, status)
         return {
             "status": status,
             "message": message,
@@ -1131,7 +1399,7 @@ class SevenSegmentLiveBackend:
         img[~actual_on & expected_on] = (0, 210, 255)
         return cv2.resize(img, (720, 480), interpolation=cv2.INTER_NEAREST)
 
-    def start_video_detection(self, video_path: str, realtime: bool = True) -> dict[str, Any]:
+    def start_video_detection(self, video_path: str, realtime: bool = True, sample_fps: float | None = None) -> dict[str, Any]:
         raw_path = video_path.strip().strip('"')
         if not raw_path:
             raise ValueError("请先选择视频文件")
@@ -1154,10 +1422,11 @@ class SevenSegmentLiveBackend:
             self.detecting = True
             self.frozen = False
             self.state = DetectionState(result="RUNNING")
+            self.clear_observed_templates()
             self.last_payload = {
                 "ok": True,
                 "result": "RUNNING",
-                "message": "正在播放视频并实时检测",
+                "message": "正在播放视频并实时检测" if realtime else "正在逐帧快速检测视频",
                 "coverage": 0.0,
                 "ordered_hits": 0,
                 "sequence_count": len(self.sequence),
@@ -1175,15 +1444,16 @@ class SevenSegmentLiveBackend:
         self.video_stop.clear()
         self.video_thread = threading.Thread(
             target=self.video_detection_loop,
-            args=(str(video), realtime),
+            args=(str(video), realtime, sample_fps),
             name="sevenseg-video-detector",
             daemon=True,
         )
         self.video_thread.start()
-        self.log(f"开始视频实时检测: {video}")
+        mode = "实时" if realtime else "逐帧快速"
+        self.log(f"开始视频{mode}检测: {video}")
         return self.status()
 
-    def video_detection_loop(self, video_path: str, realtime: bool = True) -> None:
+    def video_detection_loop(self, video_path: str, realtime: bool = True, sample_fps: float | None = None) -> None:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             with self.lock:
@@ -1196,6 +1466,9 @@ class SevenSegmentLiveBackend:
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         if fps <= 1 or fps > 240:
             fps = 25.0
+        target_sample_fps = fps if realtime else float(sample_fps if sample_fps is not None else self.video_offline_sample_fps)
+        sample_stride = 1 if realtime or target_sample_fps <= 0 else max(1, int(round(fps / max(target_sample_fps, 0.1))))
+        effective_sample_fps = fps / sample_stride
         frame_interval = 1.0 / fps
         next_frame_due = time.perf_counter()
         frame_count = 0
@@ -1242,8 +1515,10 @@ class SevenSegmentLiveBackend:
                     capture_window_started = loop_started
                     capture_window_frames = 0
 
+                next_processed = processed + 1
+                update_visuals = next_processed == 1 or next_processed % self.video_visual_update_stride == 0
                 with self.detector_lock:
-                    payload = self._process_frame(frame)
+                    payload = self._process_frame(frame, update_visuals=update_visuals, event_visuals=True)
                 processed += 1
                 expected_id = str(payload.get("expected_template_id", ""))
                 detected_id = str(payload.get("template_id", ""))
@@ -1340,6 +1615,9 @@ class SevenSegmentLiveBackend:
                         "template_id": payload.get("template_id", ""),
                         "quality": payload.get("quality", {}),
                     }
+                if self.sequence and self.state.ordered_hits >= len(self.sequence):
+                    self.log("视频关键模板已全部命中，提前结束检测")
+                    break
 
                 if realtime:
                     next_frame_due += frame_interval
@@ -1355,13 +1633,21 @@ class SevenSegmentLiveBackend:
                             frame_count += 1
                             skipped += 1
                             next_frame_due += frame_interval
+                elif sample_stride > 1:
+                    for _ in range(sample_stride - 1):
+                        if self.video_stop.is_set():
+                            break
+                        if not cap.grab():
+                            break
+                        frame_count += 1
+                        capture_window_frames += 1
 
             elapsed_total = time.time() - started
             coverage = self.state.ordered_hits / max(len(self.sequence), 1)
-            has_quality_issue = quality_counts.get("review", 0) > 0 or quality_counts.get("ng", 0) > 0
             quality_status = "NG" if quality_counts.get("ng", 0) > 0 else ("REVIEW" if quality_counts.get("review", 0) > 0 else "PASS")
-            sequence_pass = self.state.ordered_hits >= len(self.sequence) * self.min_ordered_coverage
-            overall_status = "PASS" if sequence_pass and not has_quality_issue else "NG"
+            sequence_pass = self.state.ordered_hits >= len(self.sequence)
+            # Video import alarms are driven by full sequence coverage; quality issues stay diagnostic.
+            overall_status = "PASS" if sequence_pass else "NG"
             sequence_status = "PASS" if sequence_pass else "NG"
             summary = {
                 "source": video_path,
@@ -1370,6 +1656,9 @@ class SevenSegmentLiveBackend:
                 "quality_status": quality_status,
                 "frame_count_read": frame_count,
                 "frames_processed": processed,
+                "sample_stride": sample_stride,
+                "sample_fps": effective_sample_fps,
+                "source_fps": fps,
                 "matched_frames": matched_frames,
                 "unknown_frames": unknown_frames,
                 "quality_counts": quality_counts,
@@ -1474,7 +1763,7 @@ class SevenSegmentLiveBackend:
         finally:
             cap.release()
 
-    def run_video_detection(self, video_path: str, quick: bool = False) -> dict[str, Any]:
+    def run_video_detection(self, video_path: str, quick: bool = False, sample_fps: float | None = None) -> dict[str, Any]:
         raw_path = video_path.strip().strip('"')
         if not raw_path:
             raise ValueError("请先选择视频文件")
@@ -1496,6 +1785,17 @@ class SevenSegmentLiveBackend:
         cap = cv2.VideoCapture(str(video))
         if not cap.isOpened():
             raise RuntimeError(f"无法打开视频: {video}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        if fps <= 1 or fps > 240:
+            fps = 25.0
+        if sample_fps is not None:
+            target_sample_fps = float(sample_fps)
+        elif quick:
+            target_sample_fps = 8.0
+        else:
+            target_sample_fps = self.video_offline_sample_fps
+        sample_stride = 1 if target_sample_fps <= 0 else max(1, int(round(fps / max(target_sample_fps, 0.1))))
+        effective_sample_fps = fps / sample_stride
         out_dir.mkdir(parents=True, exist_ok=True)
         frame_count = 0
         processed = 0
@@ -1511,8 +1811,10 @@ class SevenSegmentLiveBackend:
             old_quality_template = self._last_quality_template_id
             old_sequence_only = self.sequence_only_video
             old_video_source = self.video_source
+            old_observed_buffer = list(self.observed_template_buffer)
             self.state = DetectionState(result="RUNNING")
             self.frozen = False
+            self.clear_observed_templates()
             self.sequence_only_video = True
             self.video_source = str(video)
             self._quality_matched_counter = 0
@@ -1522,9 +1824,9 @@ class SevenSegmentLiveBackend:
                 if not ok:
                     break
                 frame_count += 1
-                if quick and frame_count % 2 == 0:
-                    continue
-                last_payload = self._process_frame(frame)
+                next_processed = processed + 1
+                update_visuals = next_processed == 1 or next_processed % self.video_visual_update_stride == 0
+                last_payload = self._process_frame(frame, update_visuals=update_visuals, event_visuals=True)
                 processed += 1
                 if last_payload.get("status") == "matched":
                     matched_frames += 1
@@ -1539,6 +1841,14 @@ class SevenSegmentLiveBackend:
                         "template_id": last_payload.get("template_id", ""),
                         "quality": last_payload.get("quality", {}),
                     }
+                if self.sequence and self.state.ordered_hits >= len(self.sequence):
+                    self.log("视频关键模板已全部命中，提前结束检测")
+                    break
+                if sample_stride > 1:
+                    for _ in range(sample_stride - 1):
+                        if not cap.grab():
+                            break
+                        frame_count += 1
             summary_payload = dict(last_payload)
             final_state = self.state
             final_frozen = self.frozen
@@ -1546,15 +1856,16 @@ class SevenSegmentLiveBackend:
             self.frozen = old_frozen
             self.sequence_only_video = old_sequence_only
             self.video_source = old_video_source
+            self.observed_template_buffer = old_observed_buffer
             self._quality_matched_counter = old_quality_counter
             self._last_quality_template_id = old_quality_template
         cap.release()
         elapsed = time.time() - started
         coverage = final_state.ordered_hits / max(len(self.sequence), 1)
-        has_quality_issue = quality_counts.get("review", 0) > 0 or quality_counts.get("ng", 0) > 0
         quality_status = "NG" if quality_counts.get("ng", 0) > 0 else ("REVIEW" if quality_counts.get("review", 0) > 0 else "PASS")
-        sequence_pass = final_state.ordered_hits >= len(self.sequence) * self.min_ordered_coverage
-        overall_status = "PASS" if sequence_pass and not has_quality_issue else "NG"
+        sequence_pass = final_state.ordered_hits >= len(self.sequence)
+        # Video import alarms are driven by full sequence coverage; quality issues stay diagnostic.
+        overall_status = "PASS" if sequence_pass else "NG"
         sequence_status = "PASS" if sequence_pass else "NG"
         summary = {
             "source": str(video),
@@ -1563,6 +1874,9 @@ class SevenSegmentLiveBackend:
             "quality_status": quality_status,
             "frame_count_read": frame_count,
             "frames_processed": processed,
+            "sample_stride": sample_stride,
+            "sample_fps": effective_sample_fps,
+            "source_fps": fps,
             "matched_frames": matched_frames,
             "unknown_frames": unknown_frames,
             "quality_counts": quality_counts,
@@ -1608,6 +1922,9 @@ class SevenSegmentLiveBackend:
         return self.sequence[self.state.cursor]
 
     def render_template_image(self, template_id: str) -> np.ndarray | None:
+        cache_key = (template_id, (0, 0))
+        if cache_key in self.template_image_cache:
+            return self.template_image_cache[cache_key]
         template = self.templates_by_id.get(template_id)
         if template is None or not template.image:
             return None
@@ -1618,6 +1935,7 @@ class SevenSegmentLiveBackend:
         image = cv2.imread(str(target))
         if image is None:
             return None
+        self.template_image_cache[cache_key] = image
         return image
 
     @staticmethod
@@ -1931,9 +2249,13 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path in ("/api/ack", "/ack"):
                 self.write(*json_bytes(BACKEND.ack()))
             elif parsed.path in ("/api/video_start", "/video_start"):
-                self.write(*json_bytes(BACKEND.start_video_detection(str(payload.get("path", "")), bool(payload.get("realtime", True)))))
+                sample_fps_raw = payload.get("sample_fps", None)
+                sample_fps = None if sample_fps_raw in (None, "") else float(sample_fps_raw)
+                self.write(*json_bytes(BACKEND.start_video_detection(str(payload.get("path", "")), bool(payload.get("realtime", True)), sample_fps)))
             elif parsed.path in ("/api/video_detect", "/video_detect"):
-                self.write(*json_bytes(BACKEND.run_video_detection(str(payload.get("path", "")), bool(payload.get("quick", False)))))
+                sample_fps_raw = payload.get("sample_fps", None)
+                sample_fps = None if sample_fps_raw in (None, "") else float(sample_fps_raw)
+                self.write(*json_bytes(BACKEND.run_video_detection(str(payload.get("path", "")), bool(payload.get("quick", False)), sample_fps)))
             else:
                 self.write(*json_bytes({"ok": False, "error": "not found"}, 404))
         except Exception as exc:

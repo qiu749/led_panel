@@ -46,6 +46,17 @@ tools/
 # C# build
 csharp/**/bin/
 csharp/**/obj/
+csharp/**/build_out.txt
+csharp/**/build_exit.txt
+
+# Local diagnostics / scratch output
+scratch/
+.tmp/
+.ultralytics/
+%SystemDrive%/
+_states_out.txt
+v_err.txt
+v_exit.txt
 
 # OS
 Thumbs.db

@@ -23,6 +23,7 @@ public partial class Form1 : Form
     private Button stopButton = null!;
     private Button detectButton = null!;
     private Button autoButton = null!;
+    private Button videoButton = null!;
     private Button settingsButton = null!;
     private Panel settingsPanel = null!;
     private ComboBox modelCombo = null!;
@@ -71,11 +72,71 @@ public partial class Form1 : Form
         var bottom = new Panel
         {
             Dock = DockStyle.Bottom,
-            Height = 128,
+            Height = 196,
             BackColor = Color.FromArgb(26, 26, 26),
-            Padding = new Padding(16, 10, 16, 10)
+            Padding = new Padding(16, 8, 16, 10)
         };
 
+        var bottomLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            BackColor = Color.FromArgb(26, 26, 26)
+        };
+        bottomLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
+        bottomLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        // 工具栏：型号 + 操作按钮，整行铺满并允许换行，避免按钮被挡住。
+        var toolbar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            AutoScroll = false
+        };
+
+        modelCombo = new ComboBox
+        {
+            Width = 150,
+            Height = 44,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Margin = new Padding(4, 6, 8, 0),
+            Font = new Font("Microsoft YaHei UI", 11F, FontStyle.Bold),
+            BackColor = Color.FromArgb(54, 54, 54),
+            ForeColor = Color.White,
+            FlatStyle = FlatStyle.Flat
+        };
+        modelCombo.Items.AddRange(new object[] { ModelMe70, ModelDotPanel });
+        modelCombo.SelectedIndex = 0;
+        modelCombo.SelectedIndexChanged += OnModelChanged;
+
+        previewButton = MakeButton("开始预览", 108, OnPreviewClicked);
+        stopButton = MakeButton("停止", 74, async (_, _) => await StopPreviewAsync());
+        detectButton = MakeButton("检测一次", 108, async (_, _) => await RunDetectionAsync(triggeredByAuto: false));
+        autoButton = MakeButton("自动检测", 112, OnAutoClicked);
+        videoButton = MakeButton("导入视频检测", 132, async (_, _) => await RunVideoDetectionAsync());
+        settingsButton = MakeButton("设置", 74, (_, _) => ToggleSettings());
+        alarmCheck = new CheckBox
+        {
+            Text = "NG报警",
+            Checked = true,
+            Width = 88,
+            Height = 44,
+            Margin = new Padding(5, 6, 5, 0),
+            ForeColor = Color.White,
+            TextAlign = ContentAlignment.MiddleCenter,
+            Appearance = Appearance.Button,
+            FlatStyle = FlatStyle.Flat
+        };
+        alarmCheck.FlatAppearance.BorderColor = Color.FromArgb(90, 90, 90);
+
+        toolbar.Controls.Add(MakeCaption("型号"));
+        toolbar.Controls.Add(modelCombo);
+        toolbar.Controls.AddRange(new Control[] { previewButton, stopButton, detectButton, autoButton, videoButton, settingsButton, alarmCheck });
+
+        // 结果行：左侧大字 PASS/NG，右侧明细。
+        var resultRow = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(26, 26, 26) };
         resultLabel = new Label
         {
             AutoSize = false,
@@ -87,7 +148,6 @@ public partial class Form1 : Form
             ForeColor = Color.White,
             BackColor = Color.FromArgb(78, 78, 78)
         };
-
         detailLabel = new Label
         {
             AutoSize = false,
@@ -98,55 +158,12 @@ public partial class Form1 : Form
             ForeColor = Color.White,
             Padding = new Padding(18, 0, 12, 0)
         };
+        resultRow.Controls.Add(detailLabel);
+        resultRow.Controls.Add(resultLabel);
 
-        var commandPanel = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Right,
-            Width = 720,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            Padding = new Padding(8, 12, 0, 0)
-        };
-
-        modelCombo = new ComboBox
-        {
-            Width = 150,
-            Height = 46,
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            Margin = new Padding(5, 6, 5, 0),
-            Font = new Font("Microsoft YaHei UI", 11F, FontStyle.Bold),
-            BackColor = Color.FromArgb(54, 54, 54),
-            ForeColor = Color.White,
-            FlatStyle = FlatStyle.Flat
-        };
-        modelCombo.Items.AddRange(new object[] { ModelMe70, ModelDotPanel });
-        modelCombo.SelectedIndex = 0;
-        modelCombo.SelectedIndexChanged += OnModelChanged;
-
-        previewButton = MakeButton("开始预览", 112, OnPreviewClicked);
-        stopButton = MakeButton("停止", 78, async (_, _) => await StopPreviewAsync());
-        detectButton = MakeButton("检测一次", 112, async (_, _) => await RunDetectionAsync(triggeredByAuto: false));
-        autoButton = MakeButton("自动检测", 118, OnAutoClicked);
-        settingsButton = MakeButton("设置", 78, (_, _) => ToggleSettings());
-        alarmCheck = new CheckBox
-        {
-            Text = "NG报警",
-            Checked = true,
-            Width = 92,
-            Height = 46,
-            ForeColor = Color.White,
-            TextAlign = ContentAlignment.MiddleCenter,
-            Appearance = Appearance.Button,
-            FlatStyle = FlatStyle.Flat
-        };
-        alarmCheck.FlatAppearance.BorderColor = Color.FromArgb(90, 90, 90);
-        commandPanel.Controls.Add(MakeCaption("型号"));
-        commandPanel.Controls.Add(modelCombo);
-        commandPanel.Controls.AddRange(new Control[] { previewButton, stopButton, detectButton, autoButton, settingsButton, alarmCheck });
-
-        bottom.Controls.Add(detailLabel);
-        bottom.Controls.Add(commandPanel);
-        bottom.Controls.Add(resultLabel);
+        bottomLayout.Controls.Add(toolbar, 0, 0);
+        bottomLayout.Controls.Add(resultRow, 0, 1);
+        bottom.Controls.Add(bottomLayout);
 
         settingsPanel = BuildSettingsPanel();
 
@@ -442,6 +459,13 @@ public partial class Form1 : Form
 
     private async Task RunDetectionAsync(bool triggeredByAuto)
     {
+        if (InvokeRequired)
+        {
+            var uiTask = (Task)Invoke(new Func<Task>(() => RunDetectionAsync(triggeredByAuto)));
+            await uiTask;
+            return;
+        }
+
         if (detecting)
         {
             return;
@@ -491,6 +515,71 @@ public partial class Form1 : Form
             return (string)Invoke(() => SelectedModel());
         }
         return modelCombo.SelectedItem?.ToString() ?? ModelMe70;
+    }
+
+    private async Task RunVideoDetectionAsync()
+    {
+        if (detecting)
+        {
+            return;
+        }
+        string videoPath;
+        using (var dialog = new OpenFileDialog
+        {
+            Title = "选择测试视频",
+            Filter = "视频文件|*.avi;*.mp4;*.mov;*.mkv;*.wmv|所有文件|*.*",
+            CheckFileExists = true,
+            Multiselect = false
+        })
+        {
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+            {
+                return;
+            }
+            videoPath = dialog.FileName;
+        }
+
+        if (string.IsNullOrWhiteSpace(videoPath) || !File.Exists(videoPath))
+        {
+            MessageBox.Show("所选视频文件不存在或无效，请重新选择！", "文件错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        detecting = true;
+        videoButton.Enabled = false;
+        detectButton.Enabled = false;
+        try
+        {
+            await ConfigureBackendAsync();
+            SetStatus("WAIT", $"正在载入视频: {Path.GetFileName(videoPath)}", Color.FromArgb(55, 95, 150));
+            
+            // 将视频路径作为 "camera" 传给后端启动视频流预览！
+            await PostJsonAsync("/start_preview", new { camera = videoPath });
+            previewing = true;
+            
+            // 自动开启“自动检测”，使其像实时相机一样自动、循环播放和检测
+            autoDetecting = true;
+            UpdateAutoButton();
+            autoDetectTimer.Start();
+            
+            SetStatus("AUTO", $"[视频模式] 正在播放并自动检测: {Path.GetFileName(videoPath)}", Color.FromArgb(55, 95, 150));
+            
+            // 立即进行一次初始检测
+            _ = Task.Run(async () => {
+                await Task.Delay(200); // 给视频流一点点启动稳定时间
+                await RunDetectionAsync(triggeredByAuto: true);
+            });
+        }
+        catch (Exception ex)
+        {
+            SetStatus("ERROR", "视频载入失败: " + ex.Message, Color.FromArgb(170, 30, 30));
+        }
+        finally
+        {
+            videoButton.Enabled = true;
+            detectButton.Enabled = true;
+            detecting = false;
+        }
     }
 
     private static string BuildFallbackDetail(JsonElement root, string model)
@@ -606,7 +695,9 @@ public partial class Form1 : Form
 
     private async Task<JsonDocument> PostJsonAsync(string path, object payload)
     {
-        using var response = await http.PostAsJsonAsync(path, payload);
+        var json = JsonSerializer.Serialize(payload);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        using var response = await http.PostAsync(path, content);
         response.EnsureSuccessStatusCode();
         await using var stream = await response.Content.ReadAsStreamAsync();
         return await JsonDocument.ParseAsync(stream);

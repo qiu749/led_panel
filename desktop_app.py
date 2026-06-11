@@ -183,6 +183,7 @@ class OpenCVCameraStream:
         self.cap: cv2.VideoCapture | None = None
         self.latest_frame: np.ndarray | None = None
         self.latest_frame_time = 0.0
+        self.frame_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=300)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -211,6 +212,29 @@ class OpenCVCameraStream:
                 return None
             return self.latest_frame.copy()
 
+    def get_next_frame(self) -> np.ndarray | None:
+        try:
+            return self.frame_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _store_frame(self, frame: np.ndarray) -> None:
+        stored = frame.copy()
+        with self._lock:
+            self.latest_frame = stored
+            self.latest_frame_time = time.time()
+        try:
+            self.frame_queue.put_nowait(stored)
+        except queue.Full:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.frame_queue.put_nowait(stored)
+            except queue.Full:
+                pass
+
     def _loop(self) -> None:
         index = int(self.camera.index or 0)
         self.log(f"打开摄像头: {self.camera.label}")
@@ -229,9 +253,7 @@ class OpenCVCameraStream:
             if not ok or frame is None:
                 time.sleep(0.03)
                 continue
-            with self._lock:
-                self.latest_frame = frame.copy()
-                self.latest_frame_time = time.time()
+            self._store_frame(frame)
             time.sleep(0.005)
         cap.release()
         self.cap = None
@@ -515,6 +537,7 @@ class HikvisionCameraStream:
         self.cam: Any | None = None
         self.latest_frame: np.ndarray | None = None
         self.latest_frame_time = 0.0
+        self.frame_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=300)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -542,6 +565,29 @@ class HikvisionCameraStream:
                 return None
             return self.latest_frame.copy()
 
+    def get_next_frame(self) -> np.ndarray | None:
+        try:
+            return self.frame_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _store_frame(self, frame: np.ndarray) -> None:
+        stored = frame.copy()
+        with self._lock:
+            self.latest_frame = stored
+            self.latest_frame_time = time.time()
+        try:
+            self.frame_queue.put_nowait(stored)
+        except queue.Full:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.frame_queue.put_nowait(stored)
+            except queue.Full:
+                pass
+
     def _loop(self) -> None:
         try:
             self._open_device()
@@ -550,9 +596,7 @@ class HikvisionCameraStream:
                 frame = self._grab_bgr_frame(timeout_ms=1000)
                 if frame is None:
                     continue
-                with self._lock:
-                    self.latest_frame = frame
-                    self.latest_frame_time = time.time()
+                self._store_frame(frame)
         except Exception as exc:
             self.log(f"海康相机取流失败: {exc}")
         finally:
