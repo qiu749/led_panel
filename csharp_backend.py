@@ -1021,6 +1021,59 @@ class InspectionBackend:
                 })
         return cells
 
+    @staticmethod
+    def build_brightness_unit_part_templates(
+        model: dict[str, Any],
+        reference: dict[str, np.ndarray],
+        ref_mask: np.ndarray,
+        cells: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        ref_gray = cv2.cvtColor(reference["image"], cv2.COLOR_BGR2GRAY)
+        mask_bool = ref_mask > 0
+        parts: list[dict[str, Any]] = []
+
+        for cell in cells:
+            x, y, w, h = [int(value) for value in cell["bbox"]]
+            components = []
+            for comp in model.get("components", []):
+                cx, cy, cw, ch = int(comp["x"]), int(comp["y"]), int(comp["w"]), int(comp["h"])
+                center_x = cx + cw / 2.0
+                center_y = cy + ch / 2.0
+                if x <= center_x <= x + w and y <= center_y <= y + h:
+                    components.append({"x": cx, "y": cy, "w": cw, "h": ch})
+            if not components:
+                continue
+
+            components = sorted(components, key=lambda comp: comp["x"])
+            battery_components = components[:1]
+            value_components = components[1:]
+            for part_name, part_components in (("battery", battery_components), ("value", value_components)):
+                if not part_components:
+                    continue
+                x1 = max(0, min(comp["x"] for comp in part_components))
+                y1 = max(0, min(comp["y"] for comp in part_components))
+                x2 = min(mask_bool.shape[1], max(comp["x"] + comp["w"] for comp in part_components))
+                y2 = min(mask_bool.shape[0], max(comp["y"] + comp["h"] for comp in part_components))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                part_mask = mask_bool[y1:y2, x1:x2]
+                expected_area = int(np.count_nonzero(part_mask))
+                if expected_area <= 0:
+                    continue
+                ref_values = ref_gray[y1:y2, x1:x2][part_mask]
+                parts.append({
+                    "id": f"{cell['id']}_{part_name}",
+                    "cell_id": cell["id"],
+                    "group": cell["group"],
+                    "row": cell["row"],
+                    "part": part_name,
+                    "bbox": [x1, y1, x2 - x1, y2 - y1],
+                    "expected_area": expected_area,
+                    "ref_mean": float(ref_values.mean()) if ref_values.size else 1.0,
+                    "component_count": len(part_components),
+                })
+        return parts
+
     def process_brightness_panel_frames(
         self,
         frames: list[np.ndarray],
@@ -1190,19 +1243,20 @@ class InspectionBackend:
                 if group_payload is not None:
                     group_payload["ng_cell_count"] = int(group_payload.get("ng_cell_count", 0)) + 1
 
-        component_payloads: list[dict[str, Any]] = []
         bad_components: list[dict[str, Any]] = []
-        for comp in model.get("components", []):
-            cx, cy, cw, ch = int(comp["x"]), int(comp["y"]), int(comp["w"]), int(comp["h"])
+        unit_part_templates = self.build_brightness_unit_part_templates(model, reference, ref_mask, cell_templates)
+        for part in unit_part_templates:
+            cx, cy, cw, ch = [int(value) for value in part["bbox"]]
             if cx < 0 or cy < 0 or cx + cw > ref_mask.shape[1] or cy + ch > ref_mask.shape[0]:
                 continue
             comp_mask = ref_mask[cy:cy + ch, cx:cx + cw] > 0
             if not np.any(comp_mask):
                 continue
             values = aligned_gray[cy:cy + ch, cx:cx + cw][comp_mask]
-            lit_ratio = float(np.count_nonzero(values > active_gray)) / float(max(1, np.count_nonzero(comp_mask)))
+            expected_area = max(1, int(part["expected_area"]))
+            lit_ratio = float(np.count_nonzero(values > active_gray)) / float(expected_area)
             mean_value = float(values.mean()) if values.size else 0.0
-            ref_mean = max(1.0, float(comp.get("ref_mean", 1.0)))
+            ref_mean = max(1.0, float(part.get("ref_mean", 1.0)))
             mean_ratio = mean_value / ref_mean
             issues: list[str] = []
             if mean_ratio < min_component_mean_ratio:
@@ -1211,20 +1265,25 @@ class InspectionBackend:
                 issues.append(f"点亮{lit_ratio:.0%}")
             ok = not issues
             payload = {
-                "id": comp["id"],
-                "group": comp.get("group", ""),
+                "id": part["id"],
+                "cell_id": part["cell_id"],
+                "part": part["part"],
+                "group": part.get("group", ""),
+                "row": part.get("row", 0),
                 "bbox": [cx, cy, cw, ch],
+                "expected_area": expected_area,
+                "lit_area": int(np.count_nonzero(values > active_gray)),
                 "mean": round(mean_value, 3),
                 "ref_mean": round(ref_mean, 3),
                 "mean_ratio": round(mean_ratio, 4),
                 "lit_ratio": round(lit_ratio, 4),
+                "component_count": part.get("component_count", 0),
                 "ok": ok,
                 "issues": issues,
             }
-            component_payloads.append(payload)
             if not ok:
                 bad_components.append(payload)
-                group_payload = groups_by_name.get(str(comp.get("group", "")))
+                group_payload = groups_by_name.get(str(part.get("group", "")))
                 if group_payload is not None:
                     group_payload["ng_component_count"] = int(group_payload["ng_component_count"]) + 1
 
@@ -1256,6 +1315,7 @@ class InspectionBackend:
             "bad_cell_count": len(bad_cells),
             "bad_cells": bad_cells[:80],
             "cells": cell_payloads,
+            "unit_part_count": len(unit_part_templates),
             "bad_component_count": len(bad_components),
             "groups": groups_payload,
             "bad_components": bad_components[:80],
