@@ -968,6 +968,59 @@ class InspectionBackend:
         matrix = np.float32([[1, 0, -dx], [0, 1, -dy]])
         return cv2.warpAffine(image, matrix, (image.shape[1], image.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0)
 
+    @staticmethod
+    def build_brightness_cell_templates(
+        model: dict[str, Any],
+        reference: dict[str, np.ndarray],
+        ref_mask: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        thresholds = model.get("thresholds", {})
+        row_gap_px = float(thresholds.get("cell_row_gap_px", 55))
+        pad = int(thresholds.get("cell_roi_pad_px", 8))
+        ref_gray = cv2.cvtColor(reference["image"], cv2.COLOR_BGR2GRAY)
+        mask_bool = ref_mask > 0
+        height, width = mask_bool.shape[:2]
+        cells: list[dict[str, Any]] = []
+
+        for group in model.get("groups", []):
+            group_name = str(group["name"])
+            comps = sorted(
+                [comp for comp in model.get("components", []) if str(comp.get("group", "")) == group_name],
+                key=lambda comp: float(comp["y"]) + float(comp["h"]) / 2.0,
+            )
+            clusters: list[dict[str, Any]] = []
+            for comp in comps:
+                cy = float(comp["y"]) + float(comp["h"]) / 2.0
+                if not clusters or cy - float(clusters[-1]["last_y"]) > row_gap_px:
+                    clusters.append({"last_y": cy, "components": [comp]})
+                else:
+                    clusters[-1]["last_y"] = cy
+                    clusters[-1]["components"].append(comp)
+
+            for row_index, cluster in enumerate(clusters, start=1):
+                row_components = cluster["components"]
+                x1 = max(0, int(min(float(comp["x"]) for comp in row_components) - pad))
+                y1 = max(0, int(min(float(comp["y"]) for comp in row_components) - pad))
+                x2 = min(width, int(max(float(comp["x"]) + float(comp["w"]) for comp in row_components) + pad))
+                y2 = min(height, int(max(float(comp["y"]) + float(comp["h"]) for comp in row_components) + pad))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                cell_mask = mask_bool[y1:y2, x1:x2]
+                expected_area = int(np.count_nonzero(cell_mask))
+                if expected_area <= 0:
+                    continue
+                ref_values = ref_gray[y1:y2, x1:x2][cell_mask]
+                cells.append({
+                    "id": f"{group_name}R{row_index:02d}",
+                    "group": group_name,
+                    "row": row_index,
+                    "bbox": [x1, y1, x2 - x1, y2 - y1],
+                    "expected_area": expected_area,
+                    "ref_mean": float(ref_values.mean()) if ref_values.size else 1.0,
+                    "component_count": len(row_components),
+                })
+        return cells
+
     def process_brightness_panel_frames(
         self,
         frames: list[np.ndarray],
@@ -1001,6 +1054,12 @@ class InspectionBackend:
         min_component_mean_ratio = float(thresholds.get("min_component_mean_ratio", 0.62))
         min_component_lit_ratio = float(thresholds.get("min_component_lit_ratio", 0.55))
         max_ng_components_per_group = int(thresholds.get("max_ng_components_per_group", 2))
+        min_cell_area_ratio = float(thresholds.get("min_cell_area_ratio", 0.0))
+        min_cell_mean_ratio = float(thresholds.get("min_cell_mean_ratio", 0.0))
+        min_relative_cell_area_ratio = float(thresholds.get("min_relative_cell_area_ratio", 0.0))
+        min_relative_cell_mean_ratio = float(thresholds.get("min_relative_cell_mean_ratio", 0.0))
+        max_cell_extra_ratio = float(thresholds.get("max_cell_extra_ratio", 1.0))
+        max_ng_cells_per_group = int(thresholds.get("max_ng_cells_per_group", 0))
         min_alignment_overlap = float(thresholds.get("min_alignment_overlap", 0.65))
 
         groups_payload: list[dict[str, Any]] = []
@@ -1038,6 +1097,7 @@ class InspectionBackend:
                 "issues": [],
                 "warnings": warnings,
                 "ng_component_count": 0,
+                "ng_cell_count": 0,
             })
 
         median_area_ratio = float(np.median([float(group["area_ratio"]) for group in groups_payload])) if groups_payload else 0.0
@@ -1065,6 +1125,71 @@ class InspectionBackend:
                 ng_groups.append(str(group["name"]))
 
         groups_by_name = {str(group["name"]): group for group in groups_payload}
+        cell_payloads: list[dict[str, Any]] = []
+        cell_templates = self.build_brightness_cell_templates(model, reference, ref_mask)
+        ref_kernel = np.ones((5, 5), np.uint8)
+        for cell in cell_templates:
+            cx, cy, cw, ch = [int(value) for value in cell["bbox"]]
+            cell_ref_mask = ref_mask[cy:cy + ch, cx:cx + cw] > 0
+            cell_current_mask = aligned_mask[cy:cy + ch, cx:cx + cw] > 0
+            values = aligned_gray[cy:cy + ch, cx:cx + cw][cell_ref_mask]
+            expected_area = max(1, int(cell["expected_area"]))
+            lit_area = int(np.count_nonzero(values > active_gray))
+            area_ratio = float(lit_area) / float(expected_area)
+            mean_value = float(values.mean()) if values.size else 0.0
+            ref_mean = max(1.0, float(cell["ref_mean"]))
+            mean_ratio = mean_value / ref_mean
+            dilated_ref = cv2.dilate(cell_ref_mask.astype(np.uint8), ref_kernel, iterations=1) > 0
+            extra_area = int(np.count_nonzero(cell_current_mask & ~dilated_ref))
+            extra_ratio = float(extra_area) / float(expected_area)
+            cell_payloads.append({
+                "id": cell["id"],
+                "group": cell["group"],
+                "row": cell["row"],
+                "bbox": cell["bbox"],
+                "expected_area": expected_area,
+                "lit_area": lit_area,
+                "area_ratio": round(area_ratio, 4),
+                "mean": round(mean_value, 3),
+                "ref_mean": round(ref_mean, 3),
+                "mean_ratio": round(mean_ratio, 4),
+                "extra_area": extra_area,
+                "extra_ratio": round(extra_ratio, 4),
+                "component_count": cell.get("component_count", 0),
+                "ok": True,
+                "issues": [],
+            })
+
+        median_cell_area_ratio = float(np.median([float(cell["area_ratio"]) for cell in cell_payloads])) if cell_payloads else 0.0
+        median_cell_mean_ratio = float(np.median([float(cell["mean_ratio"]) for cell in cell_payloads])) if cell_payloads else 0.0
+        bad_cells: list[dict[str, Any]] = []
+        for cell in cell_payloads:
+            area_ratio = float(cell["area_ratio"])
+            mean_ratio = float(cell["mean_ratio"])
+            extra_ratio = float(cell["extra_ratio"])
+            relative_area_ratio = area_ratio / max(median_cell_area_ratio, 1e-6)
+            relative_mean_ratio = mean_ratio / max(median_cell_mean_ratio, 1e-6)
+            cell["relative_area_ratio"] = round(relative_area_ratio, 4)
+            cell["relative_mean_ratio"] = round(relative_mean_ratio, 4)
+            issues: list[str] = []
+            if min_cell_area_ratio > 0 and area_ratio < min_cell_area_ratio:
+                issues.append(f"ROI亮区不足 {area_ratio:.0%}")
+            if min_cell_mean_ratio > 0 and mean_ratio < min_cell_mean_ratio:
+                issues.append(f"ROI亮度偏低 {mean_ratio:.0%}")
+            if min_relative_cell_area_ratio > 0 and relative_area_ratio < min_relative_cell_area_ratio:
+                issues.append(f"相对亮区不足 {relative_area_ratio:.0%}")
+            if min_relative_cell_mean_ratio > 0 and relative_mean_ratio < min_relative_cell_mean_ratio:
+                issues.append(f"相对亮度偏低 {relative_mean_ratio:.0%}")
+            if extra_ratio > max_cell_extra_ratio:
+                issues.append(f"ROI多亮区 {extra_ratio:.0%}")
+            cell["issues"] = issues
+            cell["ok"] = not issues
+            if issues:
+                bad_cells.append(cell)
+                group_payload = groups_by_name.get(str(cell.get("group", "")))
+                if group_payload is not None:
+                    group_payload["ng_cell_count"] = int(group_payload.get("ng_cell_count", 0)) + 1
+
         component_payloads: list[dict[str, Any]] = []
         bad_components: list[dict[str, Any]] = []
         for comp in model.get("components", []):
@@ -1108,8 +1233,13 @@ class InspectionBackend:
             for group in groups_payload
             if int(group.get("ng_component_count", 0)) > max_ng_components_per_group
         ]
+        ng_cell_groups = [
+            group["name"]
+            for group in groups_payload
+            if int(group.get("ng_cell_count", 0)) > max_ng_cells_per_group
+        ]
         alignment_ok = align_score >= min_alignment_overlap
-        overall_ok = bool(alignment_ok and not ng_groups and not ng_component_groups)
+        overall_ok = bool(alignment_ok and not ng_groups and not ng_component_groups and not ng_cell_groups)
 
         payload = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -1120,8 +1250,12 @@ class InspectionBackend:
             "roi": {"x": x, "y": y, "w": w, "h": h},
             "alignment": {"dx": dx, "dy": dy, "score": round(align_score, 4), "ok": alignment_ok},
             "group_count": len(groups_payload),
-            "ng_count": len(ng_groups) + len(ng_component_groups) + (0 if alignment_ok else 1),
-            "ng_groups": sorted(set(ng_groups + ng_component_groups)),
+            "ng_count": len(ng_groups) + len(ng_component_groups) + len(ng_cell_groups) + (0 if alignment_ok else 1),
+            "ng_groups": sorted(set(ng_groups + ng_component_groups + ng_cell_groups)),
+            "cell_count": len(cell_payloads),
+            "bad_cell_count": len(bad_cells),
+            "bad_cells": bad_cells[:80],
+            "cells": cell_payloads,
             "bad_component_count": len(bad_components),
             "groups": groups_payload,
             "bad_components": bad_components[:80],
@@ -1170,7 +1304,13 @@ class InspectionBackend:
 
         for group in payload.get("groups", []):
             gx, gw = int(group["x"]), int(group["w"])
-            color = (0, 180, 0) if group.get("ok") and int(group.get("ng_component_count", 0)) <= max_ng_components_per_group else (0, 0, 255)
+            color = (
+                (0, 180, 0)
+                if group.get("ok")
+                and int(group.get("ng_component_count", 0)) <= max_ng_components_per_group
+                and int(group.get("ng_cell_count", 0)) == 0
+                else (0, 0, 255)
+            )
             cv2.rectangle(image, (gx, 0), (gx + gw, image.shape[0] - 1), color, 4)
             label = (
                 f"{group['name']} "
@@ -1178,6 +1318,19 @@ class InspectionBackend:
                 f"L{float(group['mean_ratio']):.0%}"
             )
             self.draw_label(image, label, gx + 8, 42, color, scale=max(0.8, scale * 0.78), thickness=thickness)
+
+        for cell in payload.get("bad_cells", [])[:40]:
+            cx, cy, cw, ch = [int(v) for v in cell["bbox"]]
+            cv2.rectangle(image, (cx, cy), (cx + cw, cy + ch), (0, 0, 255), 3)
+            self.draw_label(
+                image,
+                str(cell.get("id", "")),
+                cx + 2,
+                max(28, cy - 6),
+                (0, 0, 255),
+                scale=max(0.55, scale * 0.58),
+                thickness=max(1, thickness - 1),
+            )
 
         for comp in payload.get("bad_components", [])[:60]:
             cx, cy, cw, ch = [int(v) for v in comp["bbox"]]
@@ -1189,7 +1342,7 @@ class InspectionBackend:
         header = (
             f"{'PASS' if payload['overall_ok'] else 'NG'}  BRIGHTNESS_PANEL  "
             f"align={float(align.get('score', 0.0)):.2f}  "
-            f"NG={ng_groups}  dim={payload.get('bad_component_count', 0)}"
+            f"NG={ng_groups}  roi={payload.get('bad_cell_count', 0)}  dim={payload.get('bad_component_count', 0)}"
         )
         self.draw_label(image, header, 16, int(92 * scale), header_color, scale=max(1.0, scale), thickness=thickness)
         return image
@@ -1304,12 +1457,25 @@ class InspectionBackend:
         align = payload.get("alignment", {})
         align_score = float(align.get("score", 0.0))
         if payload.get("overall_ok"):
-            return f"PASS: 白字面板亮度合格 align={align_score:.2f} 暗亮区={payload.get('bad_component_count', 0)}"
+            return (
+                f"PASS: 白字面板亮度合格 align={align_score:.2f} "
+                f"异常ROI={payload.get('bad_cell_count', 0)} 暗亮区={payload.get('bad_component_count', 0)}"
+            )
         ng_groups = ",".join(payload.get("ng_groups", [])) or "-"
-        if not align.get("ok", True) and ng_groups == "-" and int(payload.get("bad_component_count", 0)) == 0:
+        if (
+            not align.get("ok", True)
+            and ng_groups == "-"
+            and int(payload.get("bad_cell_count", 0)) == 0
+            and int(payload.get("bad_component_count", 0)) == 0
+        ):
             return f"NG: 白字面板位置匹配不足 align={align_score:.2f}"
+        bad_cells = payload.get("bad_cells", [])
+        first_cells = ",".join(str(cell.get("id", "")) for cell in bad_cells[:5]) if isinstance(bad_cells, list) else ""
+        roi_text = f" 异常ROI={payload.get('bad_cell_count', 0)}"
+        if first_cells:
+            roi_text += f"({first_cells})"
         return (
-            f"NG: 白字面板亮度异常 NG列={ng_groups} "
+            f"NG: 白字面板亮度异常 NG列={ng_groups}{roi_text} "
             f"暗亮区={payload.get('bad_component_count', 0)} align={align_score:.2f}"
         )
 

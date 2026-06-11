@@ -606,6 +606,7 @@ public partial class Form1 : Form
         if (model == ModelBrightnessPanel)
         {
             var badComponents = root.TryGetProperty("bad_component_count", out var bad) ? bad.GetInt32() : 0;
+            var badCells = root.TryGetProperty("bad_cell_count", out var cells) ? cells.GetInt32() : 0;
             var ngGroups = "-";
             if (root.TryGetProperty("ng_groups", out var groups) && groups.ValueKind == JsonValueKind.Array)
             {
@@ -620,7 +621,7 @@ public partial class Form1 : Form
             {
                 align = alignment.TryGetProperty("score", out var score) ? score.GetDouble() : 0.0;
             }
-            return $"白字亮度 NG列={ngGroups} 暗亮区={badComponents} align={align:F2}";
+            return $"白字亮度 NG列={ngGroups} 异常ROI={badCells} 暗亮区={badComponents} align={align:F2}";
         }
         var roiCount = root.TryGetProperty("roi_count", out var roiElement) ? roiElement.GetInt32() : 0;
         var ngCount = root.TryGetProperty("ng_count", out var ngElement) ? ngElement.GetInt32() : 0;
