@@ -15,12 +15,14 @@
   "thresholds": {
     "active_gray": 114.75,
     "align_search_px": 24,
-    "min_group_area_ratio": 0.72,
-    "min_group_mean_ratio": 0.68,
+    "min_group_area_ratio": 0.5,
+    "min_group_mean_ratio": 0.52,
+    "min_relative_group_area_ratio": 0.78,
+    "min_relative_group_mean_ratio": 0.78,
     "min_group_p10_ratio": 0.5,
-    "min_component_mean_ratio": 0.62,
-    "min_component_lit_ratio": 0.55,
-    "max_ng_components_per_group": 2,
+    "min_component_mean_ratio": 0.45,
+    "min_component_lit_ratio": 0.4,
+    "max_ng_components_per_group": 8,
     "min_alignment_overlap": 0.65
   },
   "groups": [

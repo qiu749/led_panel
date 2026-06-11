@@ -995,6 +995,8 @@ class InspectionBackend:
 
         min_group_area_ratio = float(thresholds.get("min_group_area_ratio", 0.72))
         min_group_mean_ratio = float(thresholds.get("min_group_mean_ratio", 0.68))
+        min_relative_group_area_ratio = float(thresholds.get("min_relative_group_area_ratio", 0.0))
+        min_relative_group_mean_ratio = float(thresholds.get("min_relative_group_mean_ratio", 0.0))
         min_group_p10_ratio = float(thresholds.get("min_group_p10_ratio", 0.50))
         min_component_mean_ratio = float(thresholds.get("min_component_mean_ratio", 0.62))
         min_component_lit_ratio = float(thresholds.get("min_component_lit_ratio", 0.55))
@@ -1002,7 +1004,6 @@ class InspectionBackend:
         min_alignment_overlap = float(thresholds.get("min_alignment_overlap", 0.65))
 
         groups_payload: list[dict[str, Any]] = []
-        ng_groups: list[str] = []
         for group in model.get("groups", []):
             gx, gw = int(group["x"]), int(group["w"])
             ref_group_mask = ref_mask[:, gx:gx + gw] > 0
@@ -1017,17 +1018,9 @@ class InspectionBackend:
             ref_p10 = max(1.0, float(group.get("ref_p10", 1.0)))
             mean_ratio = mean_value / ref_mean
             p10_ratio = p10_value / ref_p10
-            issues: list[str] = []
             warnings: list[str] = []
-            if area_ratio < min_group_area_ratio:
-                issues.append(f"亮区面积不足 {area_ratio:.0%}")
-            if mean_ratio < min_group_mean_ratio:
-                issues.append(f"平均亮度偏低 {mean_ratio:.0%}")
             if p10_ratio < min_group_p10_ratio:
                 warnings.append(f"暗部亮度偏低 {p10_ratio:.0%}")
-            ok = not issues
-            if not ok:
-                ng_groups.append(str(group["name"]))
             groups_payload.append({
                 "name": group["name"],
                 "x": gx,
@@ -1041,11 +1034,35 @@ class InspectionBackend:
                 "p10": round(p10_value, 3),
                 "ref_p10": round(ref_p10, 3),
                 "p10_ratio": round(p10_ratio, 4),
-                "ok": ok,
-                "issues": issues,
+                "ok": True,
+                "issues": [],
                 "warnings": warnings,
                 "ng_component_count": 0,
             })
+
+        median_area_ratio = float(np.median([float(group["area_ratio"]) for group in groups_payload])) if groups_payload else 0.0
+        median_mean_ratio = float(np.median([float(group["mean_ratio"]) for group in groups_payload])) if groups_payload else 0.0
+        ng_groups: list[str] = []
+        for group in groups_payload:
+            area_ratio = float(group["area_ratio"])
+            mean_ratio = float(group["mean_ratio"])
+            relative_area_ratio = area_ratio / max(median_area_ratio, 1e-6)
+            relative_mean_ratio = mean_ratio / max(median_mean_ratio, 1e-6)
+            group["relative_area_ratio"] = round(relative_area_ratio, 4)
+            group["relative_mean_ratio"] = round(relative_mean_ratio, 4)
+            issues: list[str] = []
+            if area_ratio < min_group_area_ratio:
+                issues.append(f"亮区面积不足 {area_ratio:.0%}")
+            if mean_ratio < min_group_mean_ratio:
+                issues.append(f"平均亮度偏低 {mean_ratio:.0%}")
+            if min_relative_group_area_ratio > 0 and relative_area_ratio < min_relative_group_area_ratio:
+                issues.append(f"相对亮区不足 {relative_area_ratio:.0%}")
+            if min_relative_group_mean_ratio > 0 and relative_mean_ratio < min_relative_group_mean_ratio:
+                issues.append(f"相对亮度偏低 {relative_mean_ratio:.0%}")
+            group["issues"] = issues
+            group["ok"] = not issues
+            if issues:
+                ng_groups.append(str(group["name"]))
 
         groups_by_name = {str(group["name"]): group for group in groups_payload}
         component_payloads: list[dict[str, Any]] = []
@@ -1148,10 +1165,12 @@ class InspectionBackend:
         overlay = image.copy()
         overlay[ref_mask > 0] = (overlay[ref_mask > 0] * 0.65 + np.array([0, 120, 0]) * 0.35).astype(np.uint8)
         image = cv2.addWeighted(overlay, 0.55, image, 0.45, 0)
+        thresholds = payload.get("thresholds", {})
+        max_ng_components_per_group = int(thresholds.get("max_ng_components_per_group", 2))
 
         for group in payload.get("groups", []):
             gx, gw = int(group["x"]), int(group["w"])
-            color = (0, 180, 0) if group.get("ok") and int(group.get("ng_component_count", 0)) <= 2 else (0, 0, 255)
+            color = (0, 180, 0) if group.get("ok") and int(group.get("ng_component_count", 0)) <= max_ng_components_per_group else (0, 0, 255)
             cv2.rectangle(image, (gx, 0), (gx + gw, image.shape[0] - 1), color, 4)
             label = (
                 f"{group['name']} "
@@ -1168,9 +1187,9 @@ class InspectionBackend:
         ng_groups = ",".join(payload.get("ng_groups", [])) or "-"
         align = payload.get("alignment", {})
         header = (
-            f"{'PASS' if payload['overall_ok'] else 'NG'}  白字面板亮度  "
+            f"{'PASS' if payload['overall_ok'] else 'NG'}  BRIGHTNESS_PANEL  "
             f"align={float(align.get('score', 0.0)):.2f}  "
-            f"NG列={ng_groups}  暗亮区={payload.get('bad_component_count', 0)}"
+            f"NG={ng_groups}  dim={payload.get('bad_component_count', 0)}"
         )
         self.draw_label(image, header, 16, int(92 * scale), header_color, scale=max(1.0, scale), thickness=thickness)
         return image
