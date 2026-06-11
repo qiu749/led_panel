@@ -40,17 +40,34 @@ import detect_dot_panel as dot_panel
 DOT_PANEL_MODEL_DEFAULT = (
     RESOURCE_ROOT / "models" / "dot_panel" / "Video_20260529135514029" / "templates.json"
 )
+BRIGHTNESS_PANEL_MODEL_DEFAULT = (
+    RESOURCE_ROOT / "models" / "brightness_panel" / "Video_20260610100027363" / "templates.json"
+)
 
 # 型号标识：ME70 走 cv_template 逻辑，FS-GRMA-JC 走 detect_dot_panel 逻辑。
 MODEL_ME70 = "ME70"
 MODEL_DOT_PANEL = "FS-GRMA-JC"
+MODEL_BRIGHTNESS_PANEL = "BRIGHTNESS_PANEL"
 DOT_PANEL_ALIASES = {"FS-GRMA-JC", "FS_GRMA_JC", "FSGRMAJC", "DOT_PANEL", "DOTPANEL"}
+BRIGHTNESS_PANEL_ALIASES = {
+    "BRIGHTNESS",
+    "BRIGHTNESS_PANEL",
+    "BRIGHTNESS-PANEL",
+    "WHITE_PANEL",
+    "WHITE-BRIGHTNESS",
+    "WHITE_TEXT_PANEL",
+    "LIGHT_CHECK",
+    "亮度检测",
+    "白字面板亮度",
+}
 
 
 def normalize_model(value: str) -> str:
     name = (value or "").strip().upper()
     if name in DOT_PANEL_ALIASES:
         return MODEL_DOT_PANEL
+    if name in BRIGHTNESS_PANEL_ALIASES:
+        return MODEL_BRIGHTNESS_PANEL
     return MODEL_ME70
 
 
@@ -135,6 +152,8 @@ class InspectionBackend:
         self.camera_stream: OpenCVCameraStream | HikvisionCameraStream | VideoFileStream | None = None
         self.template_cache: dict[str, Any] = {}
         self.dot_panel_model: dict[str, Any] | None = None
+        self.brightness_panel_model: dict[str, Any] | None = None
+        self.brightness_panel_reference: dict[str, np.ndarray] | None = None
         self.dot_panel_pose_cache: dot_panel.PanelPose | None = None
         self.dot_panel_pose_signature: np.ndarray | None = None
         self.dot_panel_pose_shape: tuple[int, int] | None = None
@@ -318,6 +337,31 @@ class InspectionBackend:
             self.log(f"加载 FS-GRMA-JC 模板: {path}")
             self.dot_panel_model = json.loads(path.read_text(encoding="utf-8"))
         return self.dot_panel_model
+
+    def get_brightness_panel_model(self) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+        if self.brightness_panel_model is None or self.brightness_panel_reference is None:
+            path = BRIGHTNESS_PANEL_MODEL_DEFAULT
+            if not path.exists():
+                raise FileNotFoundError(f"白字面板亮度模板不存在: {path}")
+            model = json.loads(path.read_text(encoding="utf-8"))
+            asset_dir = path.parent
+            ref_image_path = asset_dir / str(model.get("assets", {}).get("reference_image", "reference.jpg"))
+            ref_mask_path = asset_dir / str(model.get("assets", {}).get("reference_mask", "reference_mask.png"))
+            ref_image = cv2.imread(str(ref_image_path), cv2.IMREAD_COLOR)
+            ref_mask = cv2.imread(str(ref_mask_path), cv2.IMREAD_GRAYSCALE)
+            if ref_image is None:
+                raise FileNotFoundError(f"白字面板参考图不存在: {ref_image_path}")
+            if ref_mask is None:
+                raise FileNotFoundError(f"白字面板参考mask不存在: {ref_mask_path}")
+            if ref_mask.ndim == 3:
+                ref_mask = ref_mask[:, :, 0]
+            self.log(f"加载白字面板亮度模板: {path}")
+            self.brightness_panel_model = model
+            self.brightness_panel_reference = {
+                "image": ref_image,
+                "mask": (ref_mask > 0).astype(np.uint8) * 255,
+            }
+        return self.brightness_panel_model, self.brightness_panel_reference
 
     def capture_frame_sequence(self, frame_count: int, interval_ms: int) -> list[np.ndarray]:
         frames: list[np.ndarray] = []
@@ -885,6 +929,252 @@ class InspectionBackend:
         response["message"] = self.dot_panel_result_message(payload)
         return response
 
+    def detect_brightness_panel(self, frame_count: int = 7, interval_ms: int = 60) -> dict[str, Any]:
+        frame_count = max(3, min(31, int(frame_count)))
+        interval_ms = max(5, min(1000, int(interval_ms)))
+        with self.inference_lock:
+            frames = self.capture_frame_sequence(frame_count, interval_ms)
+            if not frames:
+                raise RuntimeError("没有采集到有效帧")
+            return self.process_brightness_panel_frames(frames, tag="brightness_station")
+
+    @staticmethod
+    def max_project_frames(frames: list[np.ndarray]) -> np.ndarray:
+        if len(frames) == 1:
+            return frames[0].copy()
+        return np.max(np.stack(frames, axis=0), axis=0).astype(np.uint8)
+
+    @staticmethod
+    def estimate_brightness_alignment(
+        current_mask: np.ndarray,
+        reference_mask: np.ndarray,
+        search_px: int,
+    ) -> tuple[int, int, float]:
+        if current_mask.shape != reference_mask.shape:
+            current_mask = cv2.resize(current_mask, (reference_mask.shape[1], reference_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+        scale = 0.25
+        ref_small = cv2.resize(reference_mask, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+        cur_small = cv2.resize(current_mask, (ref_small.shape[1], ref_small.shape[0]), interpolation=cv2.INTER_NEAREST)
+        search = max(1, int(round(search_px * scale)))
+        padded = cv2.copyMakeBorder(cur_small, search, search, search, search, cv2.BORDER_CONSTANT, value=0)
+        result = cv2.matchTemplate(padded, ref_small, cv2.TM_CCORR_NORMED)
+        _, score, _, loc = cv2.minMaxLoc(result)
+        dx = int(round((loc[0] - search) / scale))
+        dy = int(round((loc[1] - search) / scale))
+        return dx, dy, float(score)
+
+    @staticmethod
+    def shift_image(image: np.ndarray, dx: int, dy: int) -> np.ndarray:
+        matrix = np.float32([[1, 0, -dx], [0, 1, -dy]])
+        return cv2.warpAffine(image, matrix, (image.shape[1], image.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0)
+
+    def process_brightness_panel_frames(
+        self,
+        frames: list[np.ndarray],
+        tag: str = "brightness_station",
+    ) -> dict[str, Any]:
+        model, reference = self.get_brightness_panel_model()
+        roi = model["roi"]
+        thresholds = model.get("thresholds", {})
+        x, y, w, h = int(roi["x"]), int(roi["y"]), int(roi["w"]), int(roi["h"])
+        projection = self.max_project_frames(frames)
+        height, width = projection.shape[:2]
+        if x < 0 or y < 0 or x + w > width or y + h > height:
+            raise RuntimeError(f"白字面板ROI超出画面: roi=({x},{y},{w},{h}) frame=({width},{height})")
+
+        panel = projection[y:y + h, x:x + w].copy()
+        gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
+        ref_mask = reference["mask"]
+        active_gray = float(thresholds.get("active_gray", 115.0))
+        current_mask = (gray > active_gray).astype(np.uint8) * 255
+        search_px = int(thresholds.get("align_search_px", 24))
+        dx, dy, align_score = self.estimate_brightness_alignment(current_mask, ref_mask, search_px)
+        aligned_gray = self.shift_image(gray, dx, dy)
+        aligned_panel = self.shift_image(panel, dx, dy)
+        aligned_mask = (aligned_gray > active_gray).astype(np.uint8) * 255
+
+        min_group_area_ratio = float(thresholds.get("min_group_area_ratio", 0.72))
+        min_group_mean_ratio = float(thresholds.get("min_group_mean_ratio", 0.68))
+        min_group_p10_ratio = float(thresholds.get("min_group_p10_ratio", 0.50))
+        min_component_mean_ratio = float(thresholds.get("min_component_mean_ratio", 0.62))
+        min_component_lit_ratio = float(thresholds.get("min_component_lit_ratio", 0.55))
+        max_ng_components_per_group = int(thresholds.get("max_ng_components_per_group", 2))
+        min_alignment_overlap = float(thresholds.get("min_alignment_overlap", 0.65))
+
+        groups_payload: list[dict[str, Any]] = []
+        ng_groups: list[str] = []
+        for group in model.get("groups", []):
+            gx, gw = int(group["x"]), int(group["w"])
+            ref_group_mask = ref_mask[:, gx:gx + gw] > 0
+            group_gray = aligned_gray[:, gx:gx + gw]
+            expected_area = max(1, int(group.get("expected_area", np.count_nonzero(ref_group_mask))))
+            expected_values = group_gray[ref_group_mask]
+            lit_values = expected_values[expected_values > active_gray]
+            area_ratio = float(len(lit_values)) / float(expected_area)
+            mean_value = float(expected_values.mean()) if expected_values.size else 0.0
+            p10_value = float(np.percentile(expected_values, 10)) if expected_values.size else 0.0
+            ref_mean = max(1.0, float(group.get("ref_mean", 1.0)))
+            ref_p10 = max(1.0, float(group.get("ref_p10", 1.0)))
+            mean_ratio = mean_value / ref_mean
+            p10_ratio = p10_value / ref_p10
+            issues: list[str] = []
+            warnings: list[str] = []
+            if area_ratio < min_group_area_ratio:
+                issues.append(f"亮区面积不足 {area_ratio:.0%}")
+            if mean_ratio < min_group_mean_ratio:
+                issues.append(f"平均亮度偏低 {mean_ratio:.0%}")
+            if p10_ratio < min_group_p10_ratio:
+                warnings.append(f"暗部亮度偏低 {p10_ratio:.0%}")
+            ok = not issues
+            if not ok:
+                ng_groups.append(str(group["name"]))
+            groups_payload.append({
+                "name": group["name"],
+                "x": gx,
+                "w": gw,
+                "expected_area": expected_area,
+                "lit_area": int(len(lit_values)),
+                "area_ratio": round(area_ratio, 4),
+                "mean": round(mean_value, 3),
+                "ref_mean": round(ref_mean, 3),
+                "mean_ratio": round(mean_ratio, 4),
+                "p10": round(p10_value, 3),
+                "ref_p10": round(ref_p10, 3),
+                "p10_ratio": round(p10_ratio, 4),
+                "ok": ok,
+                "issues": issues,
+                "warnings": warnings,
+                "ng_component_count": 0,
+            })
+
+        groups_by_name = {str(group["name"]): group for group in groups_payload}
+        component_payloads: list[dict[str, Any]] = []
+        bad_components: list[dict[str, Any]] = []
+        for comp in model.get("components", []):
+            cx, cy, cw, ch = int(comp["x"]), int(comp["y"]), int(comp["w"]), int(comp["h"])
+            if cx < 0 or cy < 0 or cx + cw > ref_mask.shape[1] or cy + ch > ref_mask.shape[0]:
+                continue
+            comp_mask = ref_mask[cy:cy + ch, cx:cx + cw] > 0
+            if not np.any(comp_mask):
+                continue
+            values = aligned_gray[cy:cy + ch, cx:cx + cw][comp_mask]
+            lit_ratio = float(np.count_nonzero(values > active_gray)) / float(max(1, np.count_nonzero(comp_mask)))
+            mean_value = float(values.mean()) if values.size else 0.0
+            ref_mean = max(1.0, float(comp.get("ref_mean", 1.0)))
+            mean_ratio = mean_value / ref_mean
+            issues: list[str] = []
+            if mean_ratio < min_component_mean_ratio:
+                issues.append(f"亮度{mean_ratio:.0%}")
+            if lit_ratio < min_component_lit_ratio:
+                issues.append(f"点亮{lit_ratio:.0%}")
+            ok = not issues
+            payload = {
+                "id": comp["id"],
+                "group": comp.get("group", ""),
+                "bbox": [cx, cy, cw, ch],
+                "mean": round(mean_value, 3),
+                "ref_mean": round(ref_mean, 3),
+                "mean_ratio": round(mean_ratio, 4),
+                "lit_ratio": round(lit_ratio, 4),
+                "ok": ok,
+                "issues": issues,
+            }
+            component_payloads.append(payload)
+            if not ok:
+                bad_components.append(payload)
+                group_payload = groups_by_name.get(str(comp.get("group", "")))
+                if group_payload is not None:
+                    group_payload["ng_component_count"] = int(group_payload["ng_component_count"]) + 1
+
+        ng_component_groups = [
+            group["name"]
+            for group in groups_payload
+            if int(group.get("ng_component_count", 0)) > max_ng_components_per_group
+        ]
+        alignment_ok = align_score >= min_alignment_overlap
+        overall_ok = bool(alignment_ok and not ng_groups and not ng_component_groups)
+
+        payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "model": MODEL_BRIGHTNESS_PANEL,
+            "overall_ok": overall_ok,
+            "status": "PASS" if overall_ok else "NG",
+            "frames_captured": len(frames),
+            "roi": {"x": x, "y": y, "w": w, "h": h},
+            "alignment": {"dx": dx, "dy": dy, "score": round(align_score, 4), "ok": alignment_ok},
+            "group_count": len(groups_payload),
+            "ng_count": len(ng_groups) + len(ng_component_groups) + (0 if alignment_ok else 1),
+            "ng_groups": sorted(set(ng_groups + ng_component_groups)),
+            "bad_component_count": len(bad_components),
+            "groups": groups_payload,
+            "bad_components": bad_components[:80],
+            "thresholds": thresholds,
+        }
+
+        result_image = self.draw_brightness_panel_result(aligned_panel, payload, ref_mask)
+        run_dir = self.output_dir / datetime.now().strftime(f"%Y%m%d_%H%M%S_{tag}")
+        frames_dir = run_dir / "frames"
+        for index, frame in enumerate(frames, start=1):
+            write_image(frames_dir / f"frame_{index:02d}.jpg", frame)
+        write_image(run_dir / "panel_aligned.jpg", aligned_panel)
+        write_image(run_dir / "current_mask.png", aligned_mask)
+        write_image(run_dir / "result.jpg", result_image)
+        save_json(run_dir / "result.json", payload)
+
+        with self.lock:
+            self.last_result_image = result_image
+            self.last_payload = payload
+            self.last_run_dir = run_dir
+        self.log(
+            f"白字面板亮度检测完成: {payload['status']} "
+            f"align={align_score:.2f} NG列={','.join(payload['ng_groups']) or '-'} "
+            f"暗亮区={payload['bad_component_count']}"
+        )
+        response = dict(payload)
+        response["run_dir"] = str(run_dir)
+        response["message"] = self.brightness_panel_result_message(payload)
+        return response
+
+    def draw_brightness_panel_result(
+        self,
+        panel: np.ndarray,
+        payload: dict[str, Any],
+        ref_mask: np.ndarray,
+    ) -> np.ndarray:
+        image = panel.copy()
+        image_width = max(1, image.shape[1])
+        scale = max(0.85, image_width / 1800)
+        thickness = max(2, int(round(image_width / 900)))
+        overlay = image.copy()
+        overlay[ref_mask > 0] = (overlay[ref_mask > 0] * 0.65 + np.array([0, 120, 0]) * 0.35).astype(np.uint8)
+        image = cv2.addWeighted(overlay, 0.55, image, 0.45, 0)
+
+        for group in payload.get("groups", []):
+            gx, gw = int(group["x"]), int(group["w"])
+            color = (0, 180, 0) if group.get("ok") and int(group.get("ng_component_count", 0)) <= 2 else (0, 0, 255)
+            cv2.rectangle(image, (gx, 0), (gx + gw, image.shape[0] - 1), color, 4)
+            label = (
+                f"{group['name']} "
+                f"A{float(group['area_ratio']):.0%} "
+                f"L{float(group['mean_ratio']):.0%}"
+            )
+            self.draw_label(image, label, gx + 8, 42, color, scale=max(0.8, scale * 0.78), thickness=thickness)
+
+        for comp in payload.get("bad_components", [])[:60]:
+            cx, cy, cw, ch = [int(v) for v in comp["bbox"]]
+            cv2.rectangle(image, (cx, cy), (cx + cw, cy + ch), (0, 0, 255), 2)
+
+        header_color = (0, 180, 0) if payload["overall_ok"] else (0, 0, 255)
+        ng_groups = ",".join(payload.get("ng_groups", [])) or "-"
+        align = payload.get("alignment", {})
+        header = (
+            f"{'PASS' if payload['overall_ok'] else 'NG'}  白字面板亮度  "
+            f"align={float(align.get('score', 0.0)):.2f}  "
+            f"NG列={ng_groups}  暗亮区={payload.get('bad_component_count', 0)}"
+        )
+        self.draw_label(image, header, 16, int(92 * scale), header_color, scale=max(1.0, scale), thickness=thickness)
+        return image
+
     def detect_video(self, path: str, model: str, max_frames: int = 60, stride: int = 5) -> dict[str, Any]:
         video_path = Path(path)
         if not path.strip():
@@ -896,8 +1186,11 @@ class InspectionBackend:
             raise RuntimeError(f"无法从视频读取有效帧: {video_path}")
         self.log(f"视频测试[{model}]: {video_path.name} 抽取 {len(frames)} 帧")
         with self.inference_lock:
-            if normalize_model(model) == MODEL_DOT_PANEL:
+            normalized_model = normalize_model(model)
+            if normalized_model == MODEL_DOT_PANEL:
                 response = self.process_dot_panel_frames(frames, tag="dotpanel_video")
+            elif normalized_model == MODEL_BRIGHTNESS_PANEL:
+                response = self.process_brightness_panel_frames(frames, tag="brightness_video")
             else:
                 frame_count = len(frames) if len(frames) % 2 == 1 else max(1, len(frames) - 1)
                 response = self.process_me70_frames(frames, frame_count, stride, tag="me70_video")
@@ -988,6 +1281,20 @@ class InspectionBackend:
         )
 
     @staticmethod
+    def brightness_panel_result_message(payload: dict[str, Any]) -> str:
+        align = payload.get("alignment", {})
+        align_score = float(align.get("score", 0.0))
+        if payload.get("overall_ok"):
+            return f"PASS: 白字面板亮度合格 align={align_score:.2f} 暗亮区={payload.get('bad_component_count', 0)}"
+        ng_groups = ",".join(payload.get("ng_groups", [])) or "-"
+        if not align.get("ok", True) and ng_groups == "-" and int(payload.get("bad_component_count", 0)) == 0:
+            return f"NG: 白字面板位置匹配不足 align={align_score:.2f}"
+        return (
+            f"NG: 白字面板亮度异常 NG列={ng_groups} "
+            f"暗亮区={payload.get('bad_component_count', 0)} align={align_score:.2f}"
+        )
+
+    @staticmethod
     def marquee_result_message(payload: dict[str, Any]) -> str:
         score = float(payload.get("order_score", 0.0))
         if payload.get("overall_ok"):
@@ -1038,6 +1345,8 @@ class Handler(BaseHTTPRequestHandler):
                 model = normalize_model(str(payload.get("model", MODEL_ME70)))
                 if model == MODEL_DOT_PANEL:
                     self.write_response(*json_bytes(BACKEND.detect_dot_panel(int(payload.get("frame_count", 5)), int(payload.get("interval_ms", 60)))))
+                elif model == MODEL_BRIGHTNESS_PANEL:
+                    self.write_response(*json_bytes(BACKEND.detect_brightness_panel(int(payload.get("frame_count", 7)), int(payload.get("interval_ms", 60)))))
                 else:
                     self.write_response(*json_bytes(BACKEND.detect(int(payload.get("frame_count", 7)), int(payload.get("interval_ms", 45)))))
             elif path == "/detect_video":

@@ -11,6 +11,7 @@ public partial class Form1 : Form
     private const int BackendPort = 8765;
     private const string ModelMe70 = "ME70";
     private const string ModelDotPanel = "FS-GRMA-JC";
+    private const string ModelBrightnessPanel = "BRIGHTNESS_PANEL";
     private readonly HttpClient http = new() { BaseAddress = new Uri($"http://127.0.0.1:{BackendPort}") };
     private readonly System.Windows.Forms.Timer previewTimer = new() { Interval = 180 };
     private readonly System.Windows.Forms.Timer autoDetectTimer = new() { Interval = 2000 };
@@ -107,7 +108,7 @@ public partial class Form1 : Form
             ForeColor = Color.White,
             FlatStyle = FlatStyle.Flat
         };
-        modelCombo.Items.AddRange(new object[] { ModelMe70, ModelDotPanel });
+        modelCombo.Items.AddRange(new object[] { ModelMe70, ModelDotPanel, ModelBrightnessPanel });
         modelCombo.SelectedIndex = 0;
         modelCombo.SelectedIndexChanged += OnModelChanged;
 
@@ -476,7 +477,7 @@ public partial class Form1 : Form
         {
             await ConfigureBackendAsync();
             var model = SelectedModel();
-            SetStatus("WAIT", model == ModelDotPanel ? "采集中，匹配点阵模板..." : "采集中，正在融合多帧...", Color.FromArgb(150, 110, 35));
+            SetStatus("WAIT", BuildCaptureMessage(model), Color.FromArgb(150, 110, 35));
             var result = await PostJsonAsync(
                 "/detect",
                 new
@@ -515,6 +516,16 @@ public partial class Form1 : Form
             return (string)Invoke(() => SelectedModel());
         }
         return modelCombo.SelectedItem?.ToString() ?? ModelMe70;
+    }
+
+    private static string BuildCaptureMessage(string model)
+    {
+        return model switch
+        {
+            ModelDotPanel => "采集中，匹配点阵模板...",
+            ModelBrightnessPanel => "采集中，对比白字亮度模板...",
+            _ => "采集中，正在融合多帧..."
+        };
     }
 
     private async Task RunVideoDetectionAsync()
@@ -592,6 +603,25 @@ public partial class Form1 : Form
             var extra = root.TryGetProperty("extra_count", out var ex) ? ex.GetInt32() : 0;
             return $"匹配 {matched}/{expected} 缺{missing} 多{extra}";
         }
+        if (model == ModelBrightnessPanel)
+        {
+            var badComponents = root.TryGetProperty("bad_component_count", out var bad) ? bad.GetInt32() : 0;
+            var ngGroups = "-";
+            if (root.TryGetProperty("ng_groups", out var groups) && groups.ValueKind == JsonValueKind.Array)
+            {
+                ngGroups = string.Join(",", groups.EnumerateArray().Select(item => item.GetString()).Where(item => !string.IsNullOrWhiteSpace(item)));
+                if (string.IsNullOrWhiteSpace(ngGroups))
+                {
+                    ngGroups = "-";
+                }
+            }
+            var align = 0.0;
+            if (root.TryGetProperty("alignment", out var alignment) && alignment.ValueKind == JsonValueKind.Object)
+            {
+                align = alignment.TryGetProperty("score", out var score) ? score.GetDouble() : 0.0;
+            }
+            return $"白字亮度 NG列={ngGroups} 暗亮区={badComponents} align={align:F2}";
+        }
         var roiCount = root.TryGetProperty("roi_count", out var roiElement) ? roiElement.GetInt32() : 0;
         var ngCount = root.TryGetProperty("ng_count", out var ngElement) ? ngElement.GetInt32() : 0;
         return $"ROI={roiCount}/20 NG={ngCount}";
@@ -607,6 +637,12 @@ public partial class Form1 : Form
             intervalInput.Value = Math.Max(intervalInput.Minimum, Math.Min(intervalInput.Maximum, 60));
             SetStatus(lastStatusText.StartsWith("PASS") || lastStatusText.StartsWith("NG") ? "READY" : "READY",
                 "已切换型号: FS-GRMA-JC（白/蓝点阵面板）", Color.FromArgb(78, 78, 78));
+        }
+        else if (model == ModelBrightnessPanel)
+        {
+            frameCountInput.Value = Math.Max(frameCountInput.Minimum, Math.Min(frameCountInput.Maximum, 7));
+            intervalInput.Value = Math.Max(intervalInput.Minimum, Math.Min(intervalInput.Maximum, 60));
+            SetStatus("READY", "已切换型号: 白字面板亮度（模板化亮度检测）", Color.FromArgb(78, 78, 78));
         }
         else
         {
