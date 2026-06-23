@@ -1469,6 +1469,10 @@ class InspectionBackend:
         strict_segment_two_failure_ignore_segments = {str(item) for item in strict_segment_two_failure_ignore_segments}
         strict_percent_ignore_min_relative_mean = float(thresholds.get("strict_percent_component_ignore_min_relative_mean", 0.0))
         strict_percent_ignore_min_align_score = float(thresholds.get("strict_percent_component_ignore_min_align_score", 0.0))
+        strict_combined_value_enabled = bool(thresholds.get("strict_combined_value_template_enabled", False))
+        strict_combined_value_min_recall = float(thresholds.get("strict_combined_value_min_recall", 0.0))
+        strict_combined_value_min_precision = float(thresholds.get("strict_combined_value_min_precision", 0.0))
+        strict_combined_value_max_cell_relative_mean = float(thresholds.get("strict_combined_value_max_cell_relative_mean", 0.0))
         tilt_degrees = abs(float(geometry_payload.get("column_angle_degrees", 0.0)))
         tilt_start = float(thresholds.get("tilted_cell_acceptance_start_degrees", 2.0))
         tilt_full = max(tilt_start + 0.01, float(thresholds.get("tilted_cell_acceptance_full_degrees", 4.0)))
@@ -1683,15 +1687,54 @@ class InspectionBackend:
                 if expected_area <= max(0, strict_component_min_area):
                     continue
                 ref_values = ref_gray[y1:y2, x1:x2][comp_mask]
+                component_acceptance = strict_component_acceptance.get(str(comp.get("id", "")), {})
+                display_part = ""
+                if isinstance(component_acceptance, dict):
+                    display_part = str(component_acceptance.get("part", ""))
                 original_component_templates.append({
                     "id": str(comp.get("id", "")),
                     "cell_id": str(owner["id"]),
                     "group": owner["group"],
                     "row": owner["row"],
+                    "acceptance_part": display_part,
                     "bbox": [x1, y1, x2 - x1, y2 - y1],
                     "expected_area": expected_area,
                     "ref_mean": float(ref_values.mean()) if ref_values.size else 1.0,
                 })
+        if strict_shape_enabled and strict_combined_value_enabled:
+            value_templates_by_cell: dict[str, list[dict[str, Any]]] = {}
+            for part in original_component_templates:
+                if str(part.get("acceptance_part", "")) in {"188", "%"}:
+                    value_templates_by_cell.setdefault(str(part["cell_id"]), []).append(part)
+            ref_gray = cv2.cvtColor(reference["image"], cv2.COLOR_BGR2GRAY)
+            combined_templates: list[dict[str, Any]] = []
+            for cell_id, parts in value_templates_by_cell.items():
+                if len(parts) < 2:
+                    continue
+                x1 = max(0, min(int(part["bbox"][0]) for part in parts))
+                y1 = max(0, min(int(part["bbox"][1]) for part in parts))
+                x2 = min(ref_mask.shape[1], max(int(part["bbox"][0]) + int(part["bbox"][2]) for part in parts))
+                y2 = min(ref_mask.shape[0], max(int(part["bbox"][1]) + int(part["bbox"][3]) for part in parts))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                combined_mask = ref_mask[y1:y2, x1:x2] > 0
+                expected_area = int(np.count_nonzero(combined_mask))
+                if expected_area <= 0:
+                    continue
+                owner = cell_payload_by_id.get(cell_id)
+                ref_values = ref_gray[y1:y2, x1:x2][combined_mask]
+                combined_templates.append({
+                    "id": f"{cell_id}_188_percent",
+                    "cell_id": cell_id,
+                    "group": owner.get("group", "") if owner is not None else "",
+                    "row": owner.get("row", 0) if owner is not None else 0,
+                    "acceptance_part": "188%",
+                    "combined_value_template": True,
+                    "bbox": [x1, y1, x2 - x1, y2 - y1],
+                    "expected_area": expected_area,
+                    "ref_mean": float(ref_values.mean()) if ref_values.size else 1.0,
+                })
+            original_component_templates = combined_templates + original_component_templates
         for part in unit_part_templates:
             cell_id = str(part["cell_id"])
             cell = cell_payload_by_id.get(cell_id)
@@ -1791,7 +1834,19 @@ class InspectionBackend:
             strict_issues: list[str] = []
             component_acceptance = strict_component_acceptance.get(str(part["id"]), {})
             display_part = "槽位"
-            if isinstance(component_acceptance, dict) and component_acceptance:
+            if bool(part.get("combined_value_template", False)):
+                display_part = "188%"
+                cell["combined_value_recall"] = round(float(recall), 4)
+                cell["combined_value_precision"] = round(float(precision), 4)
+                if (
+                    strict_combined_value_max_cell_relative_mean <= 0
+                    or float(cell.get("relative_mean_ratio", 1.0)) <= strict_combined_value_max_cell_relative_mean
+                ):
+                    if strict_combined_value_min_precision > 0 and precision < strict_combined_value_min_precision:
+                        strict_issues.append(f"{display_part}模板不符")
+                    if strict_combined_value_min_recall > 0 and recall < strict_combined_value_min_recall:
+                        strict_issues.append(f"{display_part}模板不符")
+            elif isinstance(component_acceptance, dict) and component_acceptance:
                 expected_cell_id = str(component_acceptance.get("cell_id", ""))
                 display_part = str(component_acceptance.get("part", display_part))
                 min_recall = float(component_acceptance.get("min_recall", 0.0))
