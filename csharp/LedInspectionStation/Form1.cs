@@ -562,7 +562,37 @@ public partial class Form1 : Form
         try
         {
             await ConfigureBackendAsync();
+            var model = SelectedModel();
             SetStatus("WAIT", $"正在载入视频: {Path.GetFileName(videoPath)}", Color.FromArgb(55, 95, 150));
+
+            if (model == ModelBrightnessPanel)
+            {
+                autoDetecting = false;
+                autoDetectTimer.Stop();
+                UpdateAutoButton();
+
+                var result = await PostJsonAsync(
+                    "/detect_video",
+                    new
+                    {
+                        path = videoPath,
+                        model,
+                        max_frames = 100,
+                        stride = 5
+                    });
+                var root = result.RootElement;
+                var ok = root.TryGetProperty("overall_ok", out var okElement) && okElement.GetBoolean();
+                var message = root.TryGetProperty("message", out var msgElement) ? msgElement.GetString() ?? "" : "";
+                var fallback = BuildFallbackDetail(root, model);
+                SetStatus(ok ? "PASS" : "NG", string.IsNullOrWhiteSpace(message) ? fallback : message, ok ? Color.FromArgb(30, 140, 70) : Color.FromArgb(190, 30, 30));
+                resultHoldUntil = DateTime.Now.AddSeconds(ok ? 1.2 : 3.0);
+                await LoadImageAsync("/result.jpg");
+                if (!ok && alarmCheck.Checked)
+                {
+                    _ = Task.Run(PlayAlarm);
+                }
+                return;
+            }
             
             // 将视频路径作为 "camera" 传给后端启动视频流预览！
             await PostJsonAsync("/start_preview", new { camera = videoPath });
