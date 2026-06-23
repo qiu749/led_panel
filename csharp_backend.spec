@@ -1,5 +1,4 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
 from PyInstaller.utils.hooks import collect_submodules
 from pathlib import Path
 
@@ -15,14 +14,8 @@ if mvs_runtime_dir.exists():
     datas += [(str(path), ".") for path in mvs_runtime_dir.iterdir() if path.is_file()]
 binaries = []
 hiddenimports = []
-hiddenimports += collect_submodules("torch")
-hiddenimports += collect_submodules("scipy")
 hiddenimports += collect_submodules("PIL")
 hiddenimports += collect_submodules("cv2")
-tmp_ret = collect_all("ultralytics")
-datas += tmp_ret[0]
-binaries += tmp_ret[1]
-hiddenimports += tmp_ret[2]
 
 a = Analysis(
     ["csharp_backend.py"],
@@ -33,7 +26,18 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        "datasets",
+        "easyocr",
+        "paddleocr",
+        "pandas",
+        "sklearn",
+        "tensorflow",
+        "torch",
+        "torchvision",
+        "transformers",
+        "ultralytics",
+    ],
     noarchive=False,
     optimize=0,
 )
