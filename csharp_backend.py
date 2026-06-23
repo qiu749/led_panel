@@ -1460,6 +1460,13 @@ class InspectionBackend:
         strict_segment_min_failed_per_cell = int(thresholds.get("strict_digit_segment_min_failed_per_cell", 0))
         strict_segment_per_cell_max_relative_mean = float(thresholds.get("strict_digit_segment_per_cell_max_relative_mean", 0.0))
         strict_segment_max_cell_relative_mean = float(thresholds.get("strict_digit_segment_max_cell_relative_mean", 0.0))
+        strict_segment_single_frame_enabled = bool(thresholds.get("strict_digit_segment_single_frame_enabled", False))
+        strict_segment_single_sample_count = int(thresholds.get("strict_digit_segment_single_sample_count", 15))
+        strict_segment_single_min_frames = int(thresholds.get("strict_digit_segment_single_min_frames", 5))
+        strict_segment_single_min_fail_ratio = float(thresholds.get("strict_digit_segment_single_min_fail_ratio", 0.65))
+        strict_segment_single_severe_factor = float(thresholds.get("strict_digit_segment_single_severe_factor", 0.45))
+        strict_segment_single_mean_factor = float(thresholds.get("strict_digit_segment_single_mean_factor", 0.25))
+        strict_segment_single_max_cell_relative_mean = float(thresholds.get("strict_digit_segment_single_max_cell_relative_mean", 0.0))
         strict_segment_isolated_mild_mean = float(thresholds.get("strict_digit_segment_isolated_mild_relative_mean", 0.0))
         strict_segment_isolated_min_group_cells = int(thresholds.get("strict_digit_segment_isolated_min_group_cells", 0))
         strict_segment_two_failure_min_relative_mean = float(thresholds.get("strict_digit_segment_two_failure_min_relative_mean", 0.0))
@@ -1920,7 +1927,40 @@ class InspectionBackend:
                 group_payload["ng_component_count"] = int(group_payload.get("ng_component_count", 0)) + 1
 
         segment_failures_by_digit: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        segment_single_failures_by_cell: dict[str, list[dict[str, Any]]] = {}
         if strict_shape_enabled and strict_segment_acceptance:
+            sampled_gray_frames: list[np.ndarray] = []
+            frame_resized_cells: dict[str, list[np.ndarray]] = {}
+            if strict_segment_single_frame_enabled and frames:
+                sample_total = max(1, min(len(frames), strict_segment_single_sample_count))
+                sample_indices = sorted({int(round(value)) for value in np.linspace(0, len(frames) - 1, sample_total)})
+                sampled_gray_frames = [cv2.cvtColor(frames[index], cv2.COLOR_BGR2GRAY) for index in sample_indices]
+
+            def frame_cell_series(cell_id: str, cell: dict[str, Any]) -> list[np.ndarray]:
+                cached = frame_resized_cells.get(cell_id)
+                if cached is not None:
+                    return cached
+                if not sampled_gray_frames:
+                    frame_resized_cells[cell_id] = []
+                    return []
+                x, y, w, h = [int(v) for v in cell["bbox"]]
+                rx, ry, rw, rh = [int(v) for v in cell["ref_bbox"]]
+                local_dx = int(cell.get("local_dx", 0))
+                local_dy = int(cell.get("local_dy", 0))
+                series: list[np.ndarray] = []
+                for frame_gray in sampled_gray_frames:
+                    if x < 0 or y < 0 or x + w > frame_gray.shape[1] or y + h > frame_gray.shape[0]:
+                        continue
+                    crop = frame_gray[y:y + h, x:x + w]
+                    if crop.size == 0:
+                        continue
+                    resized = cv2.resize(crop, (rw, rh), interpolation=cv2.INTER_LINEAR)
+                    if local_dx or local_dy:
+                        resized = self.shift_image(resized, local_dx, local_dy)
+                    series.append(resized)
+                frame_resized_cells[cell_id] = series
+                return series
+
             for segment_id, segment in strict_segment_acceptance.items():
                 if not isinstance(segment, dict):
                     continue
@@ -1963,7 +2003,39 @@ class InspectionBackend:
                 lit_area = int(np.count_nonzero(binary_crop & segment_mask))
                 recall = lit_area / max(1, expected_area)
                 min_recall = float(segment.get("min_recall", 0.0))
-                if min_recall <= 0 or recall >= min_recall:
+                stable_single_failure = False
+                single_fail_count = 0
+                single_total_count = 0
+                if strict_segment_single_frame_enabled and min_recall > 0:
+                    severe_threshold = max(0.0, min_recall * strict_segment_single_severe_factor)
+                    for frame_resized in frame_cell_series(cell_id, cell):
+                        frame_cell_values = frame_resized[cell_ref_mask]
+                        frame_norm_base = float(np.percentile(frame_cell_values, 90)) if frame_cell_values.size else 0.0
+                        if frame_norm_base <= 1.0:
+                            continue
+                        frame_segment_crop = frame_resized[local_y:local_y + local_h, local_x:local_x + local_w]
+                        frame_binary = (frame_segment_crop.astype(np.float32) / frame_norm_base) > strict_component_shape_threshold
+                        frame_lit_area = int(np.count_nonzero(frame_binary & segment_mask))
+                        frame_recall = frame_lit_area / max(1, expected_area)
+                        frame_segment_values = frame_segment_crop[segment_mask]
+                        frame_mean_ratio = float(frame_segment_values.mean()) / frame_norm_base if frame_segment_values.size else 0.0
+                        single_total_count += 1
+                        if frame_recall < severe_threshold and frame_mean_ratio < strict_segment_single_mean_factor:
+                            single_fail_count += 1
+                    required_frames = max(1, strict_segment_single_min_frames)
+                    stable_single_failure = (
+                        single_total_count >= required_frames
+                        and single_fail_count >= required_frames
+                        and (single_fail_count / max(1, single_total_count)) >= strict_segment_single_min_fail_ratio
+                    )
+                    if (
+                        stable_single_failure
+                        and strict_segment_single_max_cell_relative_mean > 0
+                        and float(cell.get("relative_mean_ratio", 1.0)) > strict_segment_single_max_cell_relative_mean
+                    ):
+                        stable_single_failure = False
+                projection_segment_failure = min_recall > 0 and recall < min_recall
+                if not projection_segment_failure and not stable_single_failure:
                     continue
                 cx, cy, cw, ch = [int(v) for v in cell["bbox"]]
                 draw_bbox = [
@@ -1989,12 +2061,17 @@ class InspectionBackend:
                     "mean_ratio": 0.0,
                     "lit_ratio": round(float(recall), 4),
                     "min_lit_ratio": round(float(min_recall), 4),
+                    "single_frame_fail_count": int(single_fail_count),
+                    "single_frame_total_count": int(single_total_count),
+                    "single_frame_stable": bool(stable_single_failure),
                     "shape_threshold": round(float(strict_component_shape_threshold), 4),
                     "component_count": 1,
                     "ok": False,
                     "issues": ["188段缺失"],
                 }
                 segment_failures_by_digit.setdefault((cell_id, digit), []).append(segment_payload)
+                if stable_single_failure:
+                    segment_single_failures_by_cell.setdefault(cell_id, []).append(segment_payload)
 
             accepted_segment_failures: dict[tuple[str, str], list[dict[str, Any]]] = {}
             candidate_cells_by_group: dict[str, set[str]] = {}
@@ -2032,13 +2109,24 @@ class InspectionBackend:
                         continue
                     accepted_segment_failures[(cell_id, "cell")] = failures
                     candidate_cells_by_group.setdefault(str(cell.get("group", "")), set()).add(cell_id)
+                    accepted_cells.add(cell_id)
 
-            for (cell_id, _digit), failures in accepted_segment_failures.items():
+            for cell_id, failures in segment_single_failures_by_cell.items():
+                if cell_id in accepted_cells or not failures:
+                    continue
+                cell = cell_payload_by_id.get(cell_id)
+                if cell is None:
+                    continue
+                accepted_segment_failures[(cell_id, "single")] = failures[:1]
+                candidate_cells_by_group.setdefault(str(cell.get("group", "")), set()).add(cell_id)
+
+            for (cell_id, failure_mode), failures in accepted_segment_failures.items():
                 cell = cell_payload_by_id.get(cell_id)
                 if cell is None:
                     continue
                 if (
-                    strict_segment_isolated_mild_mean > 0
+                    failure_mode != "single"
+                    and strict_segment_isolated_mild_mean > 0
                     and strict_segment_isolated_min_group_cells > 1
                     and float(cell.get("relative_mean_ratio", 1.0)) >= strict_segment_isolated_mild_mean
                     and len(candidate_cells_by_group.get(str(cell.get("group", "")), set())) < strict_segment_isolated_min_group_cells
@@ -2046,7 +2134,8 @@ class InspectionBackend:
                     continue
                 bad_components.extend(failures)
                 if cell_id not in bad_cell_ids:
-                    cell.setdefault("issues", []).append("188段缺失")
+                    issue_text = "188单段持续缺失" if failure_mode == "single" else "188段缺失"
+                    cell.setdefault("issues", []).append(issue_text)
                     cell["ok"] = False
                     bad_cells.append(cell)
                     bad_cell_ids.add(cell_id)
