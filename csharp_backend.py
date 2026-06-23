@@ -171,7 +171,10 @@ class InspectionBackend:
         with self.lock:
             self.logs.append(line)
             self.logs = self.logs[-300:]
-        print(line, flush=True)
+        try:
+            print(line, flush=True)
+        except OSError:
+            pass
 
     def refresh_cameras(self) -> list[dict[str, Any]]:
         cameras: list[CameraInfo] = []
@@ -964,6 +967,344 @@ class InspectionBackend:
         return dx, dy, float(score)
 
     @staticmethod
+    def projection_runs(
+        projection: np.ndarray,
+        threshold_ratio: float,
+        min_length: int,
+        blur_kernel: int,
+    ) -> list[tuple[int, int, float]]:
+        if projection.size == 0:
+            return []
+        kernel = max(3, int(blur_kernel))
+        if kernel % 2 == 0:
+            kernel += 1
+        data = projection.astype(np.float32)
+        if data.ndim == 1:
+            smooth = cv2.GaussianBlur(data.reshape(1, -1), (kernel, 1), 0).ravel()
+        else:
+            smooth = cv2.GaussianBlur(data, (kernel, 1), 0).ravel()
+        peak = float(np.max(smooth)) if smooth.size else 0.0
+        if peak <= 0:
+            return []
+        threshold = max(1.0, peak * float(threshold_ratio))
+        active = smooth > threshold
+        runs: list[tuple[int, int, float]] = []
+        start: int | None = None
+        for index, value in enumerate(active):
+            if bool(value) and start is None:
+                start = index
+            is_last = index == len(active) - 1
+            if start is not None and (not bool(value) or is_last):
+                end = index if not bool(value) else index + 1
+                if end - start >= min_length:
+                    runs.append((start, end, float(np.max(smooth[start:end]))))
+                start = None
+        return runs
+
+    @staticmethod
+    def vertical_projection_runs(
+        projection: np.ndarray,
+        threshold_ratio: float,
+        min_length: int,
+        blur_kernel: int,
+    ) -> list[tuple[int, int, float]]:
+        if projection.size == 0:
+            return []
+        kernel = max(3, int(blur_kernel))
+        if kernel % 2 == 0:
+            kernel += 1
+        smooth = cv2.GaussianBlur(projection.astype(np.float32).reshape(-1, 1), (1, kernel), 0).ravel()
+        peak = float(np.max(smooth)) if smooth.size else 0.0
+        if peak <= 0:
+            return []
+        threshold = max(1.0, peak * float(threshold_ratio))
+        active = smooth > threshold
+        runs: list[tuple[int, int, float]] = []
+        start: int | None = None
+        for index, value in enumerate(active):
+            if bool(value) and start is None:
+                start = index
+            is_last = index == len(active) - 1
+            if start is not None and (not bool(value) or is_last):
+                end = index if not bool(value) else index + 1
+                if end - start >= min_length:
+                    runs.append((start, end, float(np.max(smooth[start:end]))))
+                start = None
+        return runs
+
+    def warp_brightness_panel_by_grid(
+        self,
+        projection: np.ndarray,
+        model: dict[str, Any],
+        reference: dict[str, np.ndarray],
+        ref_mask: np.ndarray,
+        detect_gray: float,
+    ) -> tuple[np.ndarray, dict[str, Any]] | None:
+        thresholds = model.get("thresholds", {})
+        if not bool(thresholds.get("auto_grid_roi", True)):
+            return None
+
+        gray = cv2.cvtColor(projection, cv2.COLOR_BGR2GRAY)
+        mask = gray > float(detect_gray)
+        x_projection = np.count_nonzero(mask, axis=0)
+        column_runs = self.projection_runs(
+            x_projection,
+            float(thresholds.get("auto_roi_x_threshold_ratio", 0.12)),
+            int(thresholds.get("auto_roi_min_column_width", 40)),
+            int(thresholds.get("auto_roi_x_blur", 25)),
+        )
+        if len(column_runs) < 6:
+            return None
+        column_runs = sorted(column_runs, key=lambda run: run[2], reverse=True)[:6]
+        column_runs = sorted(column_runs, key=lambda run: run[0])
+        median_column_width = float(np.median([max(1, run[1] - run[0]) for run in column_runs]))
+
+        cell_templates = self.build_brightness_cell_templates(model, reference, ref_mask)
+        ref_centers = {
+            (str(cell["group"]), int(cell["row"])): (
+                float(cell["bbox"][0]) + float(cell["bbox"][2]) / 2.0,
+                float(cell["bbox"][1]) + float(cell["bbox"][3]) / 2.0,
+            )
+            for cell in cell_templates
+        }
+
+        source_points: list[list[float]] = []
+        target_points: list[list[float]] = []
+        row_counts: list[int] = []
+        detected_cells: list[dict[str, Any]] = []
+        detected_groups: list[dict[str, Any]] = []
+        column_angles: list[float] = []
+        pad_x = int(thresholds.get("auto_roi_column_pad_px", 10))
+        cell_pad_x = int(thresholds.get("auto_roi_cell_pad_x", 8))
+        cell_pad_y = int(thresholds.get("auto_roi_cell_pad_y", 8))
+        raw_columns: list[dict[str, Any]] = []
+        for column_index, (x1, x2, strength) in enumerate(column_runs, start=1):
+            col_x1 = max(0, x1 - pad_x)
+            col_x2 = min(mask.shape[1], x2 + pad_x)
+            column_mask = mask[:, col_x1:col_x2]
+            y_projection = np.count_nonzero(column_mask, axis=1)
+            row_runs = self.vertical_projection_runs(
+                y_projection,
+                float(thresholds.get("auto_roi_y_threshold_ratio", 0.25)),
+                int(thresholds.get("auto_roi_min_row_height", 20)),
+                int(thresholds.get("auto_roi_y_blur", 17)),
+            )
+            row_runs = row_runs[:13]
+            raw_columns.append({
+                "column_index": column_index,
+                "x1": int(x1),
+                "x2": int(x2),
+                "strength": float(strength),
+                "col_x1": int(col_x1),
+                "col_x2": int(col_x2),
+                "row_runs": row_runs,
+            })
+
+        full_columns = [column for column in raw_columns if len(column["row_runs"]) == 13]
+        reference_row_centers: list[float] | None = None
+        synthetic_row_height = float(thresholds.get("auto_roi_synthetic_row_height", 0.0))
+        row_pitch = float(thresholds.get("auto_roi_row_pitch", 0.0))
+        if full_columns:
+            reference_row_centers = [
+                float(np.median([
+                    (float(column["row_runs"][row_index][0]) + float(column["row_runs"][row_index][1])) / 2.0
+                    for column in full_columns
+                ]))
+                for row_index in range(13)
+            ]
+            row_heights = [
+                max(1.0, float(y2) - float(y1))
+                for column in full_columns
+                for y1, y2, _ in column["row_runs"]
+            ]
+            if synthetic_row_height <= 0:
+                synthetic_row_height = float(np.median(row_heights)) if row_heights else 32.0
+            diffs = np.diff(np.array(reference_row_centers, dtype=np.float32))
+            if row_pitch <= 0 and diffs.size:
+                row_pitch = float(np.median(diffs))
+
+        for column in raw_columns:
+            column_index = int(column["column_index"])
+            x1 = int(column["x1"])
+            x2 = int(column["x2"])
+            col_x1 = int(column["col_x1"])
+            col_x2 = int(column["col_x2"])
+            row_runs = list(column["row_runs"])
+            row_counts.append(len(row_runs))
+            group_y1: int | None = None
+            group_y2: int | None = None
+            group_x1: int | None = None
+            group_x2: int | None = None
+            row_infos: list[dict[str, Any]] = []
+            row_records: list[dict[str, Any]] = []
+            if reference_row_centers is not None and len(row_runs) < 13:
+                assigned: dict[int, dict[str, Any]] = {}
+                max_row_match_distance = max(
+                    synthetic_row_height * 1.1,
+                    (row_pitch * 0.48) if row_pitch > 0 else synthetic_row_height * 1.1,
+                )
+                for y1, y2, strength in row_runs:
+                    y_center = (float(y1) + float(y2)) / 2.0
+                    nearest_index = int(np.argmin([abs(y_center - center) for center in reference_row_centers]))
+                    distance = abs(y_center - reference_row_centers[nearest_index])
+                    if distance > max_row_match_distance:
+                        continue
+                    current = assigned.get(nearest_index)
+                    if current is None or distance < float(current["distance"]):
+                        assigned[nearest_index] = {
+                            "row_index": nearest_index + 1,
+                            "y1": int(y1),
+                            "y2": int(y2),
+                            "strength": float(strength),
+                            "synthetic": False,
+                            "distance": float(distance),
+                        }
+                half_height = max(8.0, synthetic_row_height / 2.0)
+                for row_index, y_center in enumerate(reference_row_centers, start=1):
+                    record = assigned.get(row_index - 1)
+                    if record is None:
+                        record = {
+                            "row_index": row_index,
+                            "y1": int(round(y_center - half_height)),
+                            "y2": int(round(y_center + half_height)),
+                            "strength": 0.0,
+                            "synthetic": True,
+                            "distance": 0.0,
+                        }
+                    row_records.append(record)
+            else:
+                for row_index, (y1, y2, strength) in enumerate(row_runs, start=1):
+                    row_records.append({
+                        "row_index": row_index,
+                        "y1": int(y1),
+                        "y2": int(y2),
+                        "strength": float(strength),
+                        "synthetic": False,
+                        "distance": 0.0,
+                    })
+
+            for record in row_records:
+                row_index = int(record["row_index"])
+                y1 = int(record["y1"])
+                y2 = int(record["y2"])
+                target = ref_centers.get((f"C{column_index}", row_index))
+                if target is None:
+                    continue
+                ref_cell = next(
+                    (
+                        cell for cell in cell_templates
+                        if str(cell["group"]) == f"C{column_index}" and int(cell["row"]) == row_index
+                    ),
+                    None,
+                )
+                if ref_cell is None:
+                    continue
+                row_mask = mask[max(0, int(y1)):min(mask.shape[0], int(y2)), col_x1:col_x2]
+                row_x_center = (float(x1) + float(x2)) / 2.0
+                if row_mask.size:
+                    lit_y, lit_x = np.where(row_mask)
+                    if lit_x.size >= 8:
+                        row_x_center = float(col_x1) + (float(np.min(lit_x)) + float(np.max(lit_x))) / 2.0
+                row_infos.append({
+                    "row_index": row_index,
+                    "y1": int(y1),
+                    "y2": int(y2),
+                    "target": target,
+                    "ref_cell": ref_cell,
+                    "x_center": row_x_center,
+                    "y_center": (float(y1) + float(y2)) / 2.0,
+                    "synthetic": bool(record.get("synthetic", False)),
+                })
+            x_fit: np.ndarray | None = None
+            real_row_infos = [info for info in row_infos if not bool(info.get("synthetic", False))]
+            if len(real_row_infos) >= 4:
+                fit_y = np.array([float(info["y_center"]) for info in real_row_infos], dtype=np.float32)
+                fit_x = np.array([float(info["x_center"]) for info in real_row_infos], dtype=np.float32)
+                x_fit = np.polyfit(fit_y, fit_x, 1)
+                column_angles.append(float(np.degrees(np.arctan(float(x_fit[0])))))
+            column_angle = float(np.degrees(np.arctan(float(x_fit[0])))) if x_fit is not None else 0.0
+            column_width = max(1.0, float(x2 - x1))
+            if column_width < median_column_width * 0.90:
+                column_width = median_column_width
+            nominal_cell_w = max(1, int(round(column_width)) + cell_pad_x * 2)
+            for info in row_infos:
+                center_x = float(info["x_center"])
+                if x_fit is not None:
+                    center_x = float(x_fit[0]) * float(info["y_center"]) + float(x_fit[1])
+                center_y = float(info["y_center"])
+                target = info["target"]
+                if not bool(info.get("synthetic", False)):
+                    source_points.append([center_x, center_y])
+                    target_points.append([target[0], target[1]])
+                ref_cell = info["ref_cell"]
+                bx1 = max(0, int(round(center_x - nominal_cell_w / 2.0)))
+                bx2 = min(mask.shape[1], bx1 + nominal_cell_w)
+                bx1 = max(0, bx2 - nominal_cell_w)
+                by1 = max(0, int(info["y1"]) - cell_pad_y)
+                by2 = min(mask.shape[0], int(info["y2"]) + cell_pad_y)
+                detected_cells.append({
+                    "id": ref_cell["id"],
+                    "group": ref_cell["group"],
+                    "row": ref_cell["row"],
+                    "bbox": [bx1, by1, max(1, bx2 - bx1), max(1, by2 - by1)],
+                    "ref_bbox": ref_cell["bbox"],
+                    "center": [round(float(center_x), 3), round(float(center_y), 3)],
+                    "size": [max(1, bx2 - bx1), max(1, by2 - by1)],
+                    "angle_degrees": round(column_angle, 3),
+                })
+                group_y1 = by1 if group_y1 is None else min(group_y1, by1)
+                group_y2 = by2 if group_y2 is None else max(group_y2, by2)
+                group_x1 = bx1 if group_x1 is None else min(group_x1, bx1)
+                group_x2 = bx2 if group_x2 is None else max(group_x2, bx2)
+            if group_y1 is not None and group_y2 is not None:
+                gx1 = max(0, int(group_x1 if group_x1 is not None else int(x1) - cell_pad_x))
+                gx2 = min(mask.shape[1], int(group_x2 if group_x2 is not None else int(x2) + cell_pad_x))
+                detected_groups.append({
+                    "name": f"C{column_index}",
+                    "bbox": [gx1, group_y1, max(1, gx2 - gx1), max(1, group_y2 - group_y1)],
+                })
+
+        min_points = int(thresholds.get("auto_roi_min_grid_points", 60))
+        if len(source_points) < min_points:
+            return None
+        source = np.array(source_points, dtype=np.float32)
+        target = np.array(target_points, dtype=np.float32)
+        transform, inliers = cv2.findHomography(source, target, cv2.RANSAC, 5.0)
+        if transform is None:
+            return None
+        inlier_count = int(np.count_nonzero(inliers)) if inliers is not None else len(source_points)
+        min_inliers = int(thresholds.get("auto_roi_min_grid_inliers", 55))
+        if inlier_count < min_inliers:
+            return None
+
+        warped = cv2.warpPerspective(
+            projection,
+            transform,
+            (ref_mask.shape[1], ref_mask.shape[0]),
+            flags=cv2.INTER_LINEAR,
+            borderValue=0,
+        )
+        x_min = int(min(run[0] for run in column_runs))
+        x_max = int(max(run[1] for run in column_runs))
+        y_values = [point[1] for point in source_points]
+        geometry = {
+            "method": "auto_grid",
+            "x": x_min,
+            "y": int(min(y_values)) if y_values else 0,
+            "w": x_max - x_min,
+            "h": int(max(y_values) - min(y_values)) if y_values else 0,
+            "column_count": len(column_runs),
+            "row_counts": row_counts,
+            "grid_points": len(source_points),
+            "grid_inliers": inlier_count,
+            "grid_score": round(float(inlier_count) / max(1, len(source_points)), 4),
+            "column_angle_degrees": round(float(np.median(column_angles)), 3) if column_angles else 0.0,
+            "cells": detected_cells,
+            "groups": detected_groups,
+        }
+        return warped, geometry
+
+    @staticmethod
     def shift_image(image: np.ndarray, dx: int, dy: int) -> np.ndarray:
         matrix = np.float32([[1, 0, -dx], [0, 1, -dy]])
         return cv2.warpAffine(image, matrix, (image.shape[1], image.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0)
@@ -1074,6 +1415,681 @@ class InspectionBackend:
                 })
         return parts
 
+    def process_brightness_panel_detected_grid(
+        self,
+        frames: list[np.ndarray],
+        projection: np.ndarray,
+        model: dict[str, Any],
+        reference: dict[str, np.ndarray],
+        ref_mask: np.ndarray,
+        geometry_payload: dict[str, Any],
+        tag: str,
+    ) -> dict[str, Any]:
+        thresholds = model.get("thresholds", {})
+        lit_gray = float(thresholds.get("lit_gray", thresholds.get("active_gray", 115.0)))
+        min_group_area_ratio = float(thresholds.get("min_group_area_ratio", 0.72))
+        min_group_mean_ratio = float(thresholds.get("min_group_mean_ratio", 0.68))
+        min_relative_group_area_ratio = float(thresholds.get("min_relative_group_area_ratio", 0.0))
+        min_relative_group_mean_ratio = float(thresholds.get("min_relative_group_mean_ratio", 0.0))
+        min_component_mean_ratio = float(thresholds.get("min_component_mean_ratio", 0.62))
+        min_component_lit_ratio = float(thresholds.get("min_component_lit_ratio", 0.55))
+        max_ng_components_per_group = int(thresholds.get("max_ng_components_per_group", 2))
+        min_cell_area_ratio = float(thresholds.get("min_cell_area_ratio", 0.0))
+        min_cell_mean_ratio = float(thresholds.get("min_cell_mean_ratio", 0.0))
+        min_relative_cell_area_ratio = float(thresholds.get("min_relative_cell_area_ratio", 0.0))
+        min_relative_cell_mean_ratio = float(thresholds.get("min_relative_cell_mean_ratio", 0.0))
+        max_ng_cells_per_group = int(thresholds.get("max_ng_cells_per_group", 0))
+        min_panel_median_gray = float(thresholds.get("min_panel_median_gray", 0.0))
+        cell_acceptance = thresholds.get("cell_acceptance", {})
+        calibrated_cell_mode = isinstance(cell_acceptance, dict) and bool(cell_acceptance)
+        cell_local_align_search_px = int(thresholds.get("cell_local_align_search_px", 10))
+        strict_component_shape_min_panel_gray = float(thresholds.get("strict_component_shape_min_panel_gray", 0.0))
+        strict_component_shape_max_angle_degrees = float(thresholds.get("strict_component_shape_max_angle_degrees", 0.0))
+        strict_component_shape_threshold = float(thresholds.get("strict_component_shape_threshold", 0.35))
+        min_strict_component_precision = float(thresholds.get("min_strict_component_precision", 0.0))
+        min_strict_component_recall = float(thresholds.get("min_strict_component_recall", 0.0))
+        min_strict_component_mean_ratio = float(thresholds.get("min_strict_component_mean_ratio", 0.0))
+        strict_component_min_area = int(thresholds.get("strict_component_min_area", 0))
+        strict_component_acceptance = thresholds.get("strict_component_acceptance", {})
+        if not isinstance(strict_component_acceptance, dict):
+            strict_component_acceptance = {}
+        strict_segment_acceptance = thresholds.get("strict_digit_segment_acceptance", {})
+        if not isinstance(strict_segment_acceptance, dict):
+            strict_segment_acceptance = {}
+        strict_segment_min_failed = int(thresholds.get("strict_digit_segment_min_failed_per_digit", 2))
+        strict_segment_min_failed_per_cell = int(thresholds.get("strict_digit_segment_min_failed_per_cell", 0))
+        strict_segment_per_cell_max_relative_mean = float(thresholds.get("strict_digit_segment_per_cell_max_relative_mean", 0.0))
+        strict_segment_max_cell_relative_mean = float(thresholds.get("strict_digit_segment_max_cell_relative_mean", 0.0))
+        strict_segment_isolated_mild_mean = float(thresholds.get("strict_digit_segment_isolated_mild_relative_mean", 0.0))
+        strict_segment_isolated_min_group_cells = int(thresholds.get("strict_digit_segment_isolated_min_group_cells", 0))
+        strict_segment_two_failure_min_relative_mean = float(thresholds.get("strict_digit_segment_two_failure_min_relative_mean", 0.0))
+        strict_segment_two_failure_ignore_segments = thresholds.get("strict_digit_segment_two_failure_ignore_segments", [])
+        if not isinstance(strict_segment_two_failure_ignore_segments, list):
+            strict_segment_two_failure_ignore_segments = []
+        strict_segment_two_failure_ignore_segments = {str(item) for item in strict_segment_two_failure_ignore_segments}
+        strict_percent_ignore_min_relative_mean = float(thresholds.get("strict_percent_component_ignore_min_relative_mean", 0.0))
+        strict_percent_ignore_min_align_score = float(thresholds.get("strict_percent_component_ignore_min_align_score", 0.0))
+        tilt_degrees = abs(float(geometry_payload.get("column_angle_degrees", 0.0)))
+        tilt_start = float(thresholds.get("tilted_cell_acceptance_start_degrees", 2.0))
+        tilt_full = max(tilt_start + 0.01, float(thresholds.get("tilted_cell_acceptance_full_degrees", 4.0)))
+        tilt_min_factor = float(thresholds.get("tilted_cell_acceptance_min_factor", 0.90))
+        tilt_ratio = min(1.0, max(0.0, (tilt_degrees - tilt_start) / (tilt_full - tilt_start)))
+        tilted_acceptance_factor = 1.0 - tilt_ratio * (1.0 - tilt_min_factor)
+
+        gray = cv2.cvtColor(projection, cv2.COLOR_BGR2GRAY)
+        cell_templates = self.build_brightness_cell_templates(model, reference, ref_mask)
+        cell_template_by_id = {str(cell["id"]): cell for cell in cell_templates}
+        detected_cells = list(geometry_payload.get("cells", []))
+        detected_groups = {str(group.get("name", "")): group for group in geometry_payload.get("groups", [])}
+
+        groups_payload: list[dict[str, Any]] = []
+        for group in model.get("groups", []):
+            name = str(group["name"])
+            detected_group = detected_groups.get(name, {})
+            bbox = detected_group.get("bbox", [0, 0, 1, 1])
+            groups_payload.append({
+                "name": name,
+                "x": int(bbox[0]),
+                "w": int(bbox[2]),
+                "bbox": [int(v) for v in bbox],
+                "expected_area": 0,
+                "lit_area": 0,
+                "area_ratio": 0.0,
+                "mean": 0.0,
+                "ref_mean": round(float(group.get("ref_mean", 1.0)), 3),
+                "mean_ratio": 0.0,
+                "p10": 0.0,
+                "ref_p10": round(float(group.get("ref_p10", 1.0)), 3),
+                "p10_ratio": 1.0,
+                "ok": True,
+                "issues": [],
+                "warnings": [],
+                "ng_component_count": 0,
+                "ng_cell_count": 0,
+            })
+        groups_by_name = {str(group["name"]): group for group in groups_payload}
+
+        cell_payloads: list[dict[str, Any]] = []
+        resized_cells: dict[str, np.ndarray] = {}
+        for detected in detected_cells:
+            cell_id = str(detected.get("id", ""))
+            template = cell_template_by_id.get(cell_id)
+            if template is None:
+                continue
+            x, y, w, h = [int(v) for v in detected["bbox"]]
+            rx, ry, rw, rh = [int(v) for v in template["bbox"]]
+            if x < 0 or y < 0 or x + w > gray.shape[1] or y + h > gray.shape[0]:
+                continue
+            crop = gray[y:y + h, x:x + w]
+            if crop.size == 0:
+                continue
+            resized = cv2.resize(crop, (rw, rh), interpolation=cv2.INTER_LINEAR)
+            cell_ref_mask = ref_mask[ry:ry + rh, rx:rx + rw] > 0
+            local_dx = 0
+            local_dy = 0
+            local_score = 0.0
+            if cell_local_align_search_px > 0 and np.any(cell_ref_mask):
+                resized_mask = (resized > lit_gray).astype(np.uint8) * 255
+                ref_cell_mask = cell_ref_mask.astype(np.uint8) * 255
+                local_dx, local_dy, local_score = self.estimate_brightness_alignment(
+                    resized_mask,
+                    ref_cell_mask,
+                    cell_local_align_search_px,
+                )
+                resized = self.shift_image(resized, local_dx, local_dy)
+            resized_cells[cell_id] = resized
+            values = resized[cell_ref_mask]
+            expected_area = max(1, int(template["expected_area"]))
+            lit_area = int(np.count_nonzero(values > lit_gray))
+            area_ratio = float(lit_area) / float(expected_area)
+            mean_value = float(values.mean()) if values.size else 0.0
+            ref_mean = max(1.0, float(template["ref_mean"]))
+            mean_ratio = mean_value / ref_mean
+            cell_payloads.append({
+                "id": cell_id,
+                "group": template["group"],
+                "row": template["row"],
+                "bbox": [x, y, w, h],
+                "ref_bbox": template["bbox"],
+                "expected_area": expected_area,
+                "lit_area": lit_area,
+                "area_ratio": round(area_ratio, 4),
+                "mean": round(mean_value, 3),
+                "ref_mean": round(ref_mean, 3),
+                "mean_ratio": round(mean_ratio, 4),
+                "extra_area": 0,
+                "extra_ratio": 0.0,
+                "component_count": template.get("component_count", 0),
+                "local_dx": int(local_dx),
+                "local_dy": int(local_dy),
+                "local_align_score": round(float(local_score), 4),
+                "angle_degrees": round(float(detected.get("angle_degrees", 0.0)), 3),
+                "ok": True,
+                "issues": [],
+            })
+
+        median_cell_area_ratio = float(np.median([float(cell["area_ratio"]) for cell in cell_payloads])) if cell_payloads else 0.0
+        median_cell_mean_ratio = float(np.median([float(cell["mean_ratio"]) for cell in cell_payloads])) if cell_payloads else 0.0
+        median_cell_gray = float(np.median([float(cell["mean"]) for cell in cell_payloads])) if cell_payloads else 0.0
+        bad_cells: list[dict[str, Any]] = []
+        bad_cell_ids: set[str] = set()
+        for cell in cell_payloads:
+            area_ratio = float(cell["area_ratio"])
+            mean_ratio = float(cell["mean_ratio"])
+            relative_area_ratio = area_ratio / max(median_cell_area_ratio, 1e-6)
+            relative_mean_ratio = mean_ratio / max(median_cell_mean_ratio, 1e-6)
+            cell["relative_area_ratio"] = round(relative_area_ratio, 4)
+            cell["relative_mean_ratio"] = round(relative_mean_ratio, 4)
+            issues: list[str] = []
+            acceptance = cell_acceptance.get(str(cell["id"]), {}) if isinstance(cell_acceptance, dict) else {}
+            if isinstance(acceptance, dict) and acceptance:
+                min_area = float(acceptance.get("min_area_ratio", min_cell_area_ratio)) * tilted_acceptance_factor
+                min_mean = float(acceptance.get("min_mean_ratio", min_cell_mean_ratio)) * tilted_acceptance_factor
+                cell["acceptance_factor"] = round(float(tilted_acceptance_factor), 4)
+                cell["min_area_ratio"] = round(float(min_area), 4)
+                cell["min_mean_ratio"] = round(float(min_mean), 4)
+                if area_ratio < min_area:
+                    issues.append(f"低于位置基线亮区 {area_ratio:.0%}")
+                if mean_ratio < min_mean:
+                    issues.append(f"低于位置基线亮度 {mean_ratio:.0%}")
+            else:
+                if min_cell_area_ratio > 0 and area_ratio < min_cell_area_ratio:
+                    issues.append(f"ROI亮区不足 {area_ratio:.0%}")
+                if min_cell_mean_ratio > 0 and mean_ratio < min_cell_mean_ratio:
+                    issues.append(f"ROI亮度偏低 {mean_ratio:.0%}")
+                if min_relative_cell_area_ratio > 0 and relative_area_ratio < min_relative_cell_area_ratio:
+                    issues.append(f"相对亮区不足 {relative_area_ratio:.0%}")
+                if min_relative_cell_mean_ratio > 0 and relative_mean_ratio < min_relative_cell_mean_ratio:
+                    issues.append(f"相对亮度偏低 {relative_mean_ratio:.0%}")
+            cell["issues"] = issues
+            cell["ok"] = not issues
+            group_payload = groups_by_name.get(str(cell["group"]))
+            if group_payload is not None:
+                group_payload["expected_area"] = int(group_payload["expected_area"]) + int(cell["expected_area"])
+                group_payload["lit_area"] = int(group_payload["lit_area"]) + int(cell["lit_area"])
+            if issues:
+                bad_cells.append(cell)
+                bad_cell_ids.add(str(cell["id"]))
+                if group_payload is not None:
+                    group_payload["ng_cell_count"] = int(group_payload.get("ng_cell_count", 0)) + 1
+
+        for group in groups_payload:
+            cells = [cell for cell in cell_payloads if str(cell["group"]) == str(group["name"])]
+            if cells:
+                group["area_ratio"] = round(float(sum(float(cell["area_ratio"]) for cell in cells) / len(cells)), 4)
+                group["mean"] = round(float(sum(float(cell["mean"]) for cell in cells) / len(cells)), 3)
+                group["mean_ratio"] = round(float(sum(float(cell["mean_ratio"]) for cell in cells) / len(cells)), 4)
+
+        median_area_ratio = float(np.median([float(group["area_ratio"]) for group in groups_payload])) if groups_payload else 0.0
+        median_mean_ratio = float(np.median([float(group["mean_ratio"]) for group in groups_payload])) if groups_payload else 0.0
+        ng_groups: list[str] = []
+        for group in groups_payload:
+            area_ratio = float(group["area_ratio"])
+            mean_ratio = float(group["mean_ratio"])
+            relative_area_ratio = area_ratio / max(median_area_ratio, 1e-6)
+            relative_mean_ratio = mean_ratio / max(median_mean_ratio, 1e-6)
+            group["relative_area_ratio"] = round(relative_area_ratio, 4)
+            group["relative_mean_ratio"] = round(relative_mean_ratio, 4)
+            issues: list[str] = []
+            if area_ratio < min_group_area_ratio:
+                issues.append(f"亮区面积不足 {area_ratio:.0%}")
+            if mean_ratio < min_group_mean_ratio:
+                issues.append(f"平均亮度偏低 {mean_ratio:.0%}")
+            if min_relative_group_area_ratio > 0 and relative_area_ratio < min_relative_group_area_ratio:
+                issues.append(f"相对亮区不足 {relative_area_ratio:.0%}")
+            if min_relative_group_mean_ratio > 0 and relative_mean_ratio < min_relative_group_mean_ratio:
+                issues.append(f"相对亮度偏低 {relative_mean_ratio:.0%}")
+            group["issues"] = issues
+            group["ok"] = not issues
+            if issues:
+                ng_groups.append(str(group["name"]))
+
+        bad_components: list[dict[str, Any]] = []
+        unit_part_templates = self.build_brightness_unit_part_templates(model, reference, ref_mask, cell_templates)
+        cell_payload_by_id = {str(cell["id"]): cell for cell in cell_payloads}
+        strict_shape_enabled = bool(
+            (
+                strict_component_acceptance
+                or min_strict_component_precision > 0
+                or min_strict_component_recall > 0
+                or min_strict_component_mean_ratio > 0
+            )
+            and median_cell_gray >= strict_component_shape_min_panel_gray
+            and (strict_component_shape_max_angle_degrees <= 0 or tilt_degrees <= strict_component_shape_max_angle_degrees)
+        )
+        original_component_templates: list[dict[str, Any]] = []
+        if strict_shape_enabled:
+            ref_gray = cv2.cvtColor(reference["image"], cv2.COLOR_BGR2GRAY)
+            for comp in model.get("components", []):
+                px, py, pw, ph = int(comp["x"]), int(comp["y"]), int(comp["w"]), int(comp["h"])
+                center_x = px + pw / 2.0
+                center_y = py + ph / 2.0
+                owner = None
+                for cell_template in cell_templates:
+                    rx, ry, rw, rh = [int(v) for v in cell_template["bbox"]]
+                    if rx <= center_x <= rx + rw and ry <= center_y <= ry + rh:
+                        owner = cell_template
+                        break
+                if owner is None:
+                    continue
+                x1 = max(0, px)
+                y1 = max(0, py)
+                x2 = min(ref_mask.shape[1], px + pw)
+                y2 = min(ref_mask.shape[0], py + ph)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                comp_mask = ref_mask[y1:y2, x1:x2] > 0
+                expected_area = int(np.count_nonzero(comp_mask))
+                if expected_area <= max(0, strict_component_min_area):
+                    continue
+                ref_values = ref_gray[y1:y2, x1:x2][comp_mask]
+                original_component_templates.append({
+                    "id": str(comp.get("id", "")),
+                    "cell_id": str(owner["id"]),
+                    "group": owner["group"],
+                    "row": owner["row"],
+                    "bbox": [x1, y1, x2 - x1, y2 - y1],
+                    "expected_area": expected_area,
+                    "ref_mean": float(ref_values.mean()) if ref_values.size else 1.0,
+                })
+        for part in unit_part_templates:
+            cell_id = str(part["cell_id"])
+            cell = cell_payload_by_id.get(cell_id)
+            resized = resized_cells.get(cell_id)
+            if cell is None or resized is None:
+                continue
+            rx, ry, rw, rh = [int(v) for v in cell["ref_bbox"]]
+            px, py, pw, ph = [int(v) for v in part["bbox"]]
+            local_x = max(0, px - rx)
+            local_y = max(0, py - ry)
+            local_w = min(pw, rw - local_x)
+            local_h = min(ph, rh - local_y)
+            if local_w <= 0 or local_h <= 0:
+                continue
+            comp_mask = ref_mask[py:py + ph, px:px + pw] > 0
+            comp_mask = comp_mask[:local_h, :local_w]
+            values = resized[local_y:local_y + local_h, local_x:local_x + local_w][comp_mask]
+            expected_area = max(1, int(part["expected_area"]))
+            lit_ratio = float(np.count_nonzero(values > lit_gray)) / float(expected_area)
+            mean_value = float(values.mean()) if values.size else 0.0
+            ref_mean = max(1.0, float(part.get("ref_mean", 1.0)))
+            mean_ratio = mean_value / ref_mean
+            issues: list[str] = []
+            if mean_ratio < min_component_mean_ratio:
+                issues.append(f"亮度{mean_ratio:.0%}")
+            if lit_ratio < min_component_lit_ratio:
+                issues.append(f"点亮{lit_ratio:.0%}")
+            cx, cy, cw, ch = [int(v) for v in cell["bbox"]]
+            draw_bbox = [
+                int(round(cx + local_x * cw / max(1, rw))),
+                int(round(cy + local_y * ch / max(1, rh))),
+                int(round(local_w * cw / max(1, rw))),
+                int(round(local_h * ch / max(1, rh))),
+            ]
+            if issues:
+                payload = {
+                    "id": part["id"],
+                    "cell_id": cell_id,
+                    "part": part["part"],
+                    "group": part.get("group", ""),
+                    "row": part.get("row", 0),
+                    "bbox": draw_bbox,
+                    "expected_area": expected_area,
+                    "lit_area": int(np.count_nonzero(values > lit_gray)),
+                    "mean": round(mean_value, 3),
+                    "ref_mean": round(ref_mean, 3),
+                    "mean_ratio": round(mean_ratio, 4),
+                    "lit_ratio": round(lit_ratio, 4),
+                    "component_count": part.get("component_count", 0),
+                    "ok": False,
+                    "issues": issues,
+                }
+                if calibrated_cell_mode and cell.get("ok"):
+                    continue
+                bad_components.append(payload)
+                group_payload = groups_by_name.get(str(part.get("group", "")))
+                if group_payload is not None:
+                    group_payload["ng_component_count"] = int(group_payload["ng_component_count"]) + 1
+
+        for part in original_component_templates:
+            cell_id = str(part["cell_id"])
+            cell = cell_payload_by_id.get(cell_id)
+            resized = resized_cells.get(cell_id)
+            if cell is None or resized is None:
+                continue
+            rx, ry, rw, rh = [int(v) for v in cell["ref_bbox"]]
+            px, py, pw, ph = [int(v) for v in part["bbox"]]
+            x1 = max(px, rx)
+            y1 = max(py, ry)
+            x2 = min(px + pw, rx + rw, ref_mask.shape[1])
+            y2 = min(py + ph, ry + rh, ref_mask.shape[0])
+            if x2 <= x1 or y2 <= y1:
+                continue
+            local_x = x1 - rx
+            local_y = y1 - ry
+            local_w = x2 - x1
+            local_h = y2 - y1
+            comp_mask = ref_mask[y1:y2, x1:x2] > 0
+            if not np.any(comp_mask):
+                continue
+            cell_ref_mask = ref_mask[ry:ry + rh, rx:rx + rw] > 0
+            cell_values = resized[cell_ref_mask]
+            norm_base = float(np.percentile(cell_values, 90)) if cell_values.size else 0.0
+            if norm_base <= 1.0:
+                continue
+            component_crop = resized[local_y:local_y + local_h, local_x:local_x + local_w]
+            binary_crop = (component_crop.astype(np.float32) / norm_base) > strict_component_shape_threshold
+            true_positive = int(np.count_nonzero(binary_crop & comp_mask))
+            false_positive = int(np.count_nonzero(binary_crop & ~comp_mask))
+            expected_area = max(1, int(part["expected_area"]))
+            precision = true_positive / max(1, true_positive + false_positive)
+            recall = true_positive / float(expected_area)
+            values = component_crop[comp_mask]
+            mean_value = float(values.mean()) if values.size else 0.0
+            ref_mean = max(1.0, float(part.get("ref_mean", 1.0)))
+            mean_ratio = mean_value / ref_mean
+            strict_issues: list[str] = []
+            component_acceptance = strict_component_acceptance.get(str(part["id"]), {})
+            display_part = "槽位"
+            if isinstance(component_acceptance, dict) and component_acceptance:
+                expected_cell_id = str(component_acceptance.get("cell_id", ""))
+                display_part = str(component_acceptance.get("part", display_part))
+                min_recall = float(component_acceptance.get("min_recall", 0.0))
+                min_mean = float(component_acceptance.get("min_mean_ratio", 0.0))
+                min_precision = float(component_acceptance.get("min_precision", 0.0))
+                if expected_cell_id and expected_cell_id != cell_id:
+                    continue
+                if min_precision > 0 and precision < min_precision:
+                    strict_issues.append(f"{display_part}模板不符")
+                if min_recall > 0 and recall < min_recall:
+                    strict_issues.append(f"{display_part}模板不符")
+                if min_mean > 0 and mean_ratio < min_mean:
+                    strict_issues.append(f"{display_part}亮度不足")
+            else:
+                if min_strict_component_precision > 0 and precision < min_strict_component_precision:
+                    strict_issues.append(f"{display_part}模板不符")
+                if (
+                    min_strict_component_recall > 0
+                    and min_strict_component_mean_ratio > 0
+                    and recall < min_strict_component_recall
+                    and mean_ratio < min_strict_component_mean_ratio
+                ):
+                    strict_issues.append(f"{display_part}亮度不足")
+            strict_issues = list(dict.fromkeys(strict_issues))
+            if (
+                display_part == "%"
+                and strict_percent_ignore_min_relative_mean > 0
+                and float(cell.get("relative_mean_ratio", 1.0)) >= strict_percent_ignore_min_relative_mean
+                and float(cell.get("local_align_score", 0.0)) >= strict_percent_ignore_min_align_score
+            ):
+                strict_issues = []
+            if not strict_issues:
+                continue
+            cx, cy, cw, ch = [int(v) for v in cell["bbox"]]
+            draw_bbox = [
+                int(round(cx + local_x * cw / max(1, rw))),
+                int(round(cy + local_y * ch / max(1, rh))),
+                int(round(local_w * cw / max(1, rw))),
+                int(round(local_h * ch / max(1, rh))),
+            ]
+            payload = {
+                "id": f"{cell_id}_{part['id']}",
+                "cell_id": cell_id,
+                "part": display_part,
+                "group": part.get("group", ""),
+                "row": part.get("row", 0),
+                "bbox": draw_bbox,
+                "expected_area": expected_area,
+                "lit_area": true_positive,
+                "mean": round(mean_value, 3),
+                "ref_mean": round(ref_mean, 3),
+                "mean_ratio": round(mean_ratio, 4),
+                "lit_ratio": round(recall, 4),
+                "shape_precision": round(float(precision), 4),
+                "shape_threshold": round(float(strict_component_shape_threshold), 4),
+                "component_count": 1,
+                "ok": False,
+                "issues": strict_issues,
+            }
+            bad_components.append(payload)
+            if cell_id not in bad_cell_ids:
+                cell.setdefault("issues", []).append(strict_issues[0])
+                cell["ok"] = False
+                bad_cells.append(cell)
+                bad_cell_ids.add(cell_id)
+                group_payload = groups_by_name.get(str(part.get("group", "")))
+                if group_payload is not None:
+                    group_payload["ng_cell_count"] = int(group_payload.get("ng_cell_count", 0)) + 1
+            group_payload = groups_by_name.get(str(part.get("group", "")))
+            if group_payload is not None:
+                group_payload["ng_component_count"] = int(group_payload.get("ng_component_count", 0)) + 1
+
+        segment_failures_by_digit: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        if strict_shape_enabled and strict_segment_acceptance:
+            for segment_id, segment in strict_segment_acceptance.items():
+                if not isinstance(segment, dict):
+                    continue
+                cell_id = str(segment.get("cell_id", ""))
+                cell = cell_payload_by_id.get(cell_id)
+                resized = resized_cells.get(cell_id)
+                if cell is None or resized is None:
+                    continue
+                if (
+                    strict_segment_max_cell_relative_mean > 0
+                    and float(cell.get("relative_mean_ratio", 1.0)) >= strict_segment_max_cell_relative_mean
+                ):
+                    continue
+                rx, ry, rw, rh = [int(v) for v in cell["ref_bbox"]]
+                bbox = segment.get("bbox", [])
+                if not isinstance(bbox, list) or len(bbox) != 4:
+                    continue
+                sx, sy, sw, sh = [int(v) for v in bbox]
+                x1 = max(sx, rx)
+                y1 = max(sy, ry)
+                x2 = min(sx + sw, rx + rw, ref_mask.shape[1])
+                y2 = min(sy + sh, ry + rh, ref_mask.shape[0])
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                local_x = x1 - rx
+                local_y = y1 - ry
+                local_w = x2 - x1
+                local_h = y2 - y1
+                segment_mask = ref_mask[y1:y2, x1:x2] > 0
+                expected_area = int(np.count_nonzero(segment_mask))
+                if expected_area <= 0:
+                    continue
+                cell_ref_mask = ref_mask[ry:ry + rh, rx:rx + rw] > 0
+                cell_values = resized[cell_ref_mask]
+                norm_base = float(np.percentile(cell_values, 90)) if cell_values.size else 0.0
+                if norm_base <= 1.0:
+                    continue
+                segment_crop = resized[local_y:local_y + local_h, local_x:local_x + local_w]
+                binary_crop = (segment_crop.astype(np.float32) / norm_base) > strict_component_shape_threshold
+                lit_area = int(np.count_nonzero(binary_crop & segment_mask))
+                recall = lit_area / max(1, expected_area)
+                min_recall = float(segment.get("min_recall", 0.0))
+                if min_recall <= 0 or recall >= min_recall:
+                    continue
+                cx, cy, cw, ch = [int(v) for v in cell["bbox"]]
+                draw_bbox = [
+                    int(round(cx + local_x * cw / max(1, rw))),
+                    int(round(cy + local_y * ch / max(1, rh))),
+                    int(round(local_w * cw / max(1, rw))),
+                    int(round(local_h * ch / max(1, rh))),
+                ]
+                digit = str(segment.get("digit", "188"))
+                segment_payload = {
+                    "id": f"{cell_id}_{segment_id}",
+                    "cell_id": cell_id,
+                    "part": "188",
+                    "digit": digit,
+                    "segment": str(segment.get("segment", "")),
+                    "group": cell.get("group", ""),
+                    "row": cell.get("row", 0),
+                    "bbox": draw_bbox,
+                    "expected_area": expected_area,
+                    "lit_area": lit_area,
+                    "mean": round(float(segment_crop[segment_mask].mean()) if np.any(segment_mask) else 0.0, 3),
+                    "ref_mean": 0.0,
+                    "mean_ratio": 0.0,
+                    "lit_ratio": round(float(recall), 4),
+                    "min_lit_ratio": round(float(min_recall), 4),
+                    "shape_threshold": round(float(strict_component_shape_threshold), 4),
+                    "component_count": 1,
+                    "ok": False,
+                    "issues": ["188段缺失"],
+                }
+                segment_failures_by_digit.setdefault((cell_id, digit), []).append(segment_payload)
+
+            accepted_segment_failures: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            candidate_cells_by_group: dict[str, set[str]] = {}
+            segment_failures_by_cell: dict[str, list[dict[str, Any]]] = {}
+            for (cell_id, digit), failures in segment_failures_by_digit.items():
+                segment_failures_by_cell.setdefault(cell_id, []).extend(failures)
+                if len(failures) < max(1, strict_segment_min_failed):
+                    continue
+                cell = cell_payload_by_id.get(cell_id)
+                if cell is None:
+                    continue
+                if (
+                    len(failures) == 2
+                    and strict_segment_two_failure_min_relative_mean > 0
+                    and float(cell.get("relative_mean_ratio", 1.0)) >= strict_segment_two_failure_min_relative_mean
+                    and strict_segment_two_failure_ignore_segments
+                    and all(str(failure.get("segment", "")) in strict_segment_two_failure_ignore_segments for failure in failures)
+                ):
+                    continue
+                accepted_segment_failures[(cell_id, digit)] = failures
+                candidate_cells_by_group.setdefault(str(cell.get("group", "")), set()).add(cell_id)
+
+            accepted_cells = {cell_id for cell_id, _digit in accepted_segment_failures}
+            if strict_segment_min_failed_per_cell > 0:
+                for cell_id, failures in segment_failures_by_cell.items():
+                    if cell_id in accepted_cells or len(failures) < strict_segment_min_failed_per_cell:
+                        continue
+                    cell = cell_payload_by_id.get(cell_id)
+                    if cell is None:
+                        continue
+                    if (
+                        strict_segment_per_cell_max_relative_mean > 0
+                        and float(cell.get("relative_mean_ratio", 1.0)) > strict_segment_per_cell_max_relative_mean
+                    ):
+                        continue
+                    accepted_segment_failures[(cell_id, "cell")] = failures
+                    candidate_cells_by_group.setdefault(str(cell.get("group", "")), set()).add(cell_id)
+
+            for (cell_id, _digit), failures in accepted_segment_failures.items():
+                cell = cell_payload_by_id.get(cell_id)
+                if cell is None:
+                    continue
+                if (
+                    strict_segment_isolated_mild_mean > 0
+                    and strict_segment_isolated_min_group_cells > 1
+                    and float(cell.get("relative_mean_ratio", 1.0)) >= strict_segment_isolated_mild_mean
+                    and len(candidate_cells_by_group.get(str(cell.get("group", "")), set())) < strict_segment_isolated_min_group_cells
+                ):
+                    continue
+                bad_components.extend(failures)
+                if cell_id not in bad_cell_ids:
+                    cell.setdefault("issues", []).append("188段缺失")
+                    cell["ok"] = False
+                    bad_cells.append(cell)
+                    bad_cell_ids.add(cell_id)
+                    group_payload = groups_by_name.get(str(cell.get("group", "")))
+                    if group_payload is not None:
+                        group_payload["ng_cell_count"] = int(group_payload.get("ng_cell_count", 0)) + 1
+                group_payload = groups_by_name.get(str(cell.get("group", "")))
+                if group_payload is not None:
+                    group_payload["ng_component_count"] = int(group_payload.get("ng_component_count", 0)) + len(failures)
+
+        ng_component_groups = [
+            group["name"]
+            for group in groups_payload
+            if int(group.get("ng_component_count", 0)) > max_ng_components_per_group
+        ]
+        ng_cell_groups = [
+            group["name"]
+            for group in groups_payload
+            if int(group.get("ng_cell_count", 0)) > max_ng_cells_per_group
+        ]
+        panel_brightness_ok = bool(min_panel_median_gray <= 0 or median_cell_gray >= min_panel_median_gray)
+        if not panel_brightness_ok:
+            ng_groups = sorted(set(ng_groups + [str(group["name"]) for group in groups_payload]))
+        row_counts = [int(value) for value in geometry_payload.get("row_counts", [])]
+        layout_ok = bool(
+            int(geometry_payload.get("column_count", 0)) == 6
+            and len(row_counts) == 6
+            and all(count == 13 for count in row_counts)
+            and len(detected_cells) == 78
+        )
+        alignment_ok = bool(
+            layout_ok
+            and int(geometry_payload.get("grid_inliers", 0)) >= int(thresholds.get("auto_roi_min_grid_inliers", 55))
+        )
+        overall_ok = bool(alignment_ok and panel_brightness_ok and not ng_groups and not ng_component_groups and not ng_cell_groups)
+
+        payload = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "model": MODEL_BRIGHTNESS_PANEL,
+            "overall_ok": overall_ok,
+            "status": "PASS" if overall_ok else "NG",
+            "frames_captured": len(frames),
+            "roi": {
+                "x": int(geometry_payload.get("x", 0)),
+                "y": int(geometry_payload.get("y", 0)),
+                "w": int(geometry_payload.get("w", projection.shape[1])),
+                "h": int(geometry_payload.get("h", projection.shape[0])),
+                "method": "auto_grid_direct",
+            },
+            "geometry": {key: value for key, value in geometry_payload.items() if key not in {"cells", "groups"}},
+            "alignment": {
+                "dx": 0,
+                "dy": 0,
+                "score": round(float(geometry_payload.get("grid_score", 0.0)), 4),
+                "ok": alignment_ok,
+                "layout_ok": layout_ok,
+                "method": "auto_grid_direct",
+            },
+            "group_count": len(groups_payload),
+            "ng_count": len(ng_groups) + len(ng_component_groups) + len(ng_cell_groups) + (0 if alignment_ok else 1),
+            "ng_groups": sorted(set(ng_groups + ng_component_groups + ng_cell_groups)),
+            "cell_count": len(cell_payloads),
+            "bad_cell_count": len(bad_cells),
+            "bad_cells": bad_cells[:80],
+            "cells": cell_payloads,
+            "unit_part_count": len(unit_part_templates),
+            "bad_component_count": len(bad_components),
+            "median_cell_gray": round(median_cell_gray, 3),
+            "panel_brightness_ok": panel_brightness_ok,
+            "groups": groups_payload,
+            "bad_components": bad_components[:80],
+            "thresholds": thresholds,
+        }
+
+        result_image = self.draw_brightness_panel_result(projection.copy(), payload, ref_mask)
+        run_dir = self.output_dir / datetime.now().strftime(f"%Y%m%d_%H%M%S_{tag}")
+        frames_dir = run_dir / "frames"
+        for index, frame in enumerate(frames, start=1):
+            write_image(frames_dir / f"frame_{index:02d}.jpg", frame)
+        write_image(run_dir / "panel_aligned.jpg", projection)
+        write_image(run_dir / "current_mask.png", (gray > lit_gray).astype(np.uint8) * 255)
+        write_image(run_dir / "result.jpg", result_image)
+        save_json(run_dir / "result.json", payload)
+
+        with self.lock:
+            self.last_result_image = result_image
+            self.last_payload = payload
+            self.last_run_dir = run_dir
+        self.log(
+            f"白字面板亮度检测完成: {payload['status']} "
+            f"grid={payload['alignment']['score']:.2f} NG列={','.join(payload['ng_groups']) or '-'} "
+            f"暗亮区={payload['bad_component_count']}"
+        )
+        response = dict(payload)
+        response["run_dir"] = str(run_dir)
+        response["message"] = self.brightness_panel_result_message(payload)
+        return response
+
     def process_brightness_panel_frames(
         self,
         frames: list[np.ndarray],
@@ -1085,19 +2101,39 @@ class InspectionBackend:
         x, y, w, h = int(roi["x"]), int(roi["y"]), int(roi["w"]), int(roi["h"])
         projection = self.max_project_frames(frames)
         height, width = projection.shape[:2]
-        if x < 0 or y < 0 or x + w > width or y + h > height:
-            raise RuntimeError(f"白字面板ROI超出画面: roi=({x},{y},{w},{h}) frame=({width},{height})")
-
-        panel = projection[y:y + h, x:x + w].copy()
-        gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
         ref_mask = reference["mask"]
         active_gray = float(thresholds.get("active_gray", 115.0))
+        lit_gray = float(thresholds.get("lit_gray", thresholds.get("active_gray", 115.0)))
+        geometry_payload: dict[str, Any] = {"method": "fixed_roi"}
+        warped = self.warp_brightness_panel_by_grid(projection, model, reference, ref_mask, active_gray)
+        if warped is not None:
+            panel, geometry_payload = warped
+            if geometry_payload.get("cells") and geometry_payload.get("groups"):
+                return self.process_brightness_panel_detected_grid(
+                    frames,
+                    projection,
+                    model,
+                    reference,
+                    ref_mask,
+                    geometry_payload,
+                    tag,
+                )
+            x = int(geometry_payload.get("x", x))
+            y = int(geometry_payload.get("y", y))
+            w = int(ref_mask.shape[1])
+            h = int(ref_mask.shape[0])
+        else:
+            if x < 0 or y < 0 or x + w > width or y + h > height:
+                raise RuntimeError(f"白字面板ROI超出画面: roi=({x},{y},{w},{h}) frame=({width},{height})")
+            panel = projection[y:y + h, x:x + w].copy()
+
+        gray = cv2.cvtColor(panel, cv2.COLOR_BGR2GRAY)
         current_mask = (gray > active_gray).astype(np.uint8) * 255
         search_px = int(thresholds.get("align_search_px", 24))
         dx, dy, align_score = self.estimate_brightness_alignment(current_mask, ref_mask, search_px)
         aligned_gray = self.shift_image(gray, dx, dy)
         aligned_panel = self.shift_image(panel, dx, dy)
-        aligned_mask = (aligned_gray > active_gray).astype(np.uint8) * 255
+        aligned_mask = (aligned_gray > lit_gray).astype(np.uint8) * 255
 
         min_group_area_ratio = float(thresholds.get("min_group_area_ratio", 0.72))
         min_group_mean_ratio = float(thresholds.get("min_group_mean_ratio", 0.68))
@@ -1114,6 +2150,7 @@ class InspectionBackend:
         max_cell_extra_ratio = float(thresholds.get("max_cell_extra_ratio", 1.0))
         max_ng_cells_per_group = int(thresholds.get("max_ng_cells_per_group", 0))
         min_alignment_overlap = float(thresholds.get("min_alignment_overlap", 0.65))
+        min_panel_median_gray = float(thresholds.get("min_panel_median_gray", 0.0))
 
         groups_payload: list[dict[str, Any]] = []
         for group in model.get("groups", []):
@@ -1122,7 +2159,7 @@ class InspectionBackend:
             group_gray = aligned_gray[:, gx:gx + gw]
             expected_area = max(1, int(group.get("expected_area", np.count_nonzero(ref_group_mask))))
             expected_values = group_gray[ref_group_mask]
-            lit_values = expected_values[expected_values > active_gray]
+            lit_values = expected_values[expected_values > lit_gray]
             area_ratio = float(len(lit_values)) / float(expected_area)
             mean_value = float(expected_values.mean()) if expected_values.size else 0.0
             p10_value = float(np.percentile(expected_values, 10)) if expected_values.size else 0.0
@@ -1187,7 +2224,7 @@ class InspectionBackend:
             cell_current_mask = aligned_mask[cy:cy + ch, cx:cx + cw] > 0
             values = aligned_gray[cy:cy + ch, cx:cx + cw][cell_ref_mask]
             expected_area = max(1, int(cell["expected_area"]))
-            lit_area = int(np.count_nonzero(values > active_gray))
+            lit_area = int(np.count_nonzero(values > lit_gray))
             area_ratio = float(lit_area) / float(expected_area)
             mean_value = float(values.mean()) if values.size else 0.0
             ref_mean = max(1.0, float(cell["ref_mean"]))
@@ -1215,6 +2252,7 @@ class InspectionBackend:
 
         median_cell_area_ratio = float(np.median([float(cell["area_ratio"]) for cell in cell_payloads])) if cell_payloads else 0.0
         median_cell_mean_ratio = float(np.median([float(cell["mean_ratio"]) for cell in cell_payloads])) if cell_payloads else 0.0
+        median_cell_gray = float(np.median([float(cell["mean"]) for cell in cell_payloads])) if cell_payloads else 0.0
         bad_cells: list[dict[str, Any]] = []
         for cell in cell_payloads:
             area_ratio = float(cell["area_ratio"])
@@ -1254,7 +2292,7 @@ class InspectionBackend:
                 continue
             values = aligned_gray[cy:cy + ch, cx:cx + cw][comp_mask]
             expected_area = max(1, int(part["expected_area"]))
-            lit_ratio = float(np.count_nonzero(values > active_gray)) / float(expected_area)
+            lit_ratio = float(np.count_nonzero(values > lit_gray)) / float(expected_area)
             mean_value = float(values.mean()) if values.size else 0.0
             ref_mean = max(1.0, float(part.get("ref_mean", 1.0)))
             mean_ratio = mean_value / ref_mean
@@ -1272,7 +2310,7 @@ class InspectionBackend:
                 "row": part.get("row", 0),
                 "bbox": [cx, cy, cw, ch],
                 "expected_area": expected_area,
-                "lit_area": int(np.count_nonzero(values > active_gray)),
+                "lit_area": int(np.count_nonzero(values > lit_gray)),
                 "mean": round(mean_value, 3),
                 "ref_mean": round(ref_mean, 3),
                 "mean_ratio": round(mean_ratio, 4),
@@ -1284,8 +2322,8 @@ class InspectionBackend:
             if not ok:
                 bad_components.append(payload)
                 group_payload = groups_by_name.get(str(part.get("group", "")))
-                if group_payload is not None:
-                    group_payload["ng_component_count"] = int(group_payload["ng_component_count"]) + 1
+            if group_payload is not None:
+                group_payload["ng_component_count"] = int(group_payload["ng_component_count"]) + 1
 
         ng_component_groups = [
             group["name"]
@@ -1297,8 +2335,15 @@ class InspectionBackend:
             for group in groups_payload
             if int(group.get("ng_cell_count", 0)) > max_ng_cells_per_group
         ]
-        alignment_ok = align_score >= min_alignment_overlap
-        overall_ok = bool(alignment_ok and not ng_groups and not ng_component_groups and not ng_cell_groups)
+        grid_ok = (
+            str(geometry_payload.get("method", "")) == "auto_grid"
+            and int(geometry_payload.get("grid_inliers", 0)) >= int(thresholds.get("auto_roi_min_grid_inliers", 55))
+        )
+        alignment_ok = bool(align_score >= min_alignment_overlap or grid_ok)
+        panel_brightness_ok = bool(min_panel_median_gray <= 0 or median_cell_gray >= min_panel_median_gray)
+        if not panel_brightness_ok:
+            ng_groups = sorted(set(ng_groups + [str(group["name"]) for group in groups_payload]))
+        overall_ok = bool(alignment_ok and panel_brightness_ok and not ng_groups and not ng_component_groups and not ng_cell_groups)
 
         payload = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -1306,8 +2351,15 @@ class InspectionBackend:
             "overall_ok": overall_ok,
             "status": "PASS" if overall_ok else "NG",
             "frames_captured": len(frames),
-            "roi": {"x": x, "y": y, "w": w, "h": h},
-            "alignment": {"dx": dx, "dy": dy, "score": round(align_score, 4), "ok": alignment_ok},
+            "roi": {"x": x, "y": y, "w": w, "h": h, "method": geometry_payload.get("method", "fixed_roi")},
+            "geometry": geometry_payload,
+            "alignment": {
+                "dx": dx,
+                "dy": dy,
+                "score": round(align_score, 4),
+                "ok": alignment_ok,
+                "method": geometry_payload.get("method", "fixed_roi"),
+            },
             "group_count": len(groups_payload),
             "ng_count": len(ng_groups) + len(ng_component_groups) + len(ng_cell_groups) + (0 if alignment_ok else 1),
             "ng_groups": sorted(set(ng_groups + ng_component_groups + ng_cell_groups)),
@@ -1317,6 +2369,8 @@ class InspectionBackend:
             "cells": cell_payloads,
             "unit_part_count": len(unit_part_templates),
             "bad_component_count": len(bad_components),
+            "median_cell_gray": round(median_cell_gray, 3),
+            "panel_brightness_ok": panel_brightness_ok,
             "groups": groups_payload,
             "bad_components": bad_components[:80],
             "thresholds": thresholds,
@@ -1356,14 +2410,18 @@ class InspectionBackend:
         image_width = max(1, image.shape[1])
         scale = max(0.85, image_width / 1800)
         thickness = max(2, int(round(image_width / 900)))
-        overlay = image.copy()
-        overlay[ref_mask > 0] = (overlay[ref_mask > 0] * 0.65 + np.array([0, 120, 0]) * 0.35).astype(np.uint8)
-        image = cv2.addWeighted(overlay, 0.55, image, 0.45, 0)
+        if ref_mask.shape[:2] == image.shape[:2]:
+            overlay = image.copy()
+            overlay[ref_mask > 0] = (overlay[ref_mask > 0] * 0.65 + np.array([0, 120, 0]) * 0.35).astype(np.uint8)
+            image = cv2.addWeighted(overlay, 0.55, image, 0.45, 0)
         thresholds = payload.get("thresholds", {})
         max_ng_components_per_group = int(thresholds.get("max_ng_components_per_group", 2))
 
         for group in payload.get("groups", []):
-            gx, gw = int(group["x"]), int(group["w"])
+            if "bbox" in group:
+                gx, gy, gw, gh = [int(v) for v in group["bbox"]]
+            else:
+                gx, gy, gw, gh = int(group["x"]), 0, int(group["w"]), image.shape[0] - 1
             color = (
                 (0, 180, 0)
                 if group.get("ok")
@@ -1371,13 +2429,13 @@ class InspectionBackend:
                 and int(group.get("ng_cell_count", 0)) == 0
                 else (0, 0, 255)
             )
-            cv2.rectangle(image, (gx, 0), (gx + gw, image.shape[0] - 1), color, 4)
+            cv2.rectangle(image, (gx, gy), (gx + gw, gy + gh), color, 4)
             label = (
                 f"{group['name']} "
                 f"A{float(group['area_ratio']):.0%} "
                 f"L{float(group['mean_ratio']):.0%}"
             )
-            self.draw_label(image, label, gx + 8, 42, color, scale=max(0.8, scale * 0.78), thickness=thickness)
+            self.draw_label(image, label, gx + 8, max(42, gy + 34), color, scale=max(0.8, scale * 0.78), thickness=thickness)
 
         for cell in payload.get("bad_cells", [])[:40]:
             cx, cy, cw, ch = [int(v) for v in cell["bbox"]]
@@ -1392,9 +2450,15 @@ class InspectionBackend:
                 thickness=max(1, thickness - 1),
             )
 
-        for comp in payload.get("bad_components", [])[:60]:
-            cx, cy, cw, ch = [int(v) for v in comp["bbox"]]
-            cv2.rectangle(image, (cx, cy), (cx + cw, cy + ch), (0, 0, 255), 2)
+        if bool(thresholds.get("draw_component_debug_boxes", False)):
+            ng_groups = set(str(group) for group in payload.get("ng_groups", []))
+            visible_bad_components = [
+                comp for comp in payload.get("bad_components", [])
+                if str(comp.get("group", "")) in ng_groups
+            ]
+            for comp in visible_bad_components[:60]:
+                cx, cy, cw, ch = [int(v) for v in comp["bbox"]]
+                cv2.rectangle(image, (cx, cy), (cx + cw, cy + ch), (0, 0, 255), 2)
 
         header_color = (0, 180, 0) if payload["overall_ok"] else (0, 0, 255)
         ng_groups = ",".join(payload.get("ng_groups", [])) or "-"
@@ -1635,7 +2699,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"LED inspection backend listening on http://{args.host}:{args.port}", flush=True)
+    try:
+        print(f"LED inspection backend listening on http://{args.host}:{args.port}", flush=True)
+    except OSError:
+        pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
