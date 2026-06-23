@@ -154,6 +154,8 @@ class InspectionBackend:
         self.dot_panel_model: dict[str, Any] | None = None
         self.brightness_panel_model: dict[str, Any] | None = None
         self.brightness_panel_reference: dict[str, np.ndarray] | None = None
+        self.brightness_cell_templates: list[dict[str, Any]] | None = None
+        self.brightness_unit_part_templates: list[dict[str, Any]] | None = None
         self.dot_panel_pose_cache: dot_panel.PanelPose | None = None
         self.dot_panel_pose_signature: np.ndarray | None = None
         self.dot_panel_pose_shape: tuple[int, int] | None = None
@@ -364,7 +366,30 @@ class InspectionBackend:
                 "image": ref_image,
                 "mask": (ref_mask > 0).astype(np.uint8) * 255,
             }
+            self.brightness_cell_templates = None
+            self.brightness_unit_part_templates = None
         return self.brightness_panel_model, self.brightness_panel_reference
+
+    def get_brightness_cell_templates(
+        self,
+        model: dict[str, Any],
+        reference: dict[str, np.ndarray],
+        ref_mask: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        if self.brightness_cell_templates is None:
+            self.brightness_cell_templates = self.build_brightness_cell_templates(model, reference, ref_mask)
+        return self.brightness_cell_templates
+
+    def get_brightness_unit_part_templates(
+        self,
+        model: dict[str, Any],
+        reference: dict[str, np.ndarray],
+        ref_mask: np.ndarray,
+        cells: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if self.brightness_unit_part_templates is None:
+            self.brightness_unit_part_templates = self.build_brightness_unit_part_templates(model, reference, ref_mask, cells)
+        return self.brightness_unit_part_templates
 
     def capture_frame_sequence(self, frame_count: int, interval_ms: int) -> list[np.ndarray]:
         frames: list[np.ndarray] = []
@@ -936,10 +961,67 @@ class InspectionBackend:
         frame_count = max(3, min(31, int(frame_count)))
         interval_ms = max(5, min(1000, int(interval_ms)))
         with self.inference_lock:
+            model, _reference = self.get_brightness_panel_model()
+            thresholds = model.get("thresholds", {})
+            fast_enabled = bool(thresholds.get("fast_two_stage_enabled", True))
+            fast_count = max(1, min(frame_count, int(thresholds.get("fast_frame_count", 3))))
+            fast_interval_ms = max(5, min(interval_ms, int(thresholds.get("fast_interval_ms", 35))))
+            if fast_enabled and frame_count > fast_count:
+                fast_frames = self.capture_frame_sequence(fast_count, fast_interval_ms)
+                if not fast_frames:
+                    raise RuntimeError("没有采集到有效帧")
+                fast_response = self.process_brightness_panel_frames(fast_frames, tag="brightness_station_fast")
+                fast_response["inspection_mode"] = "fast"
+                fast_response["strict_frame_count"] = frame_count
+                if self.is_brightness_fast_pass_clear(fast_response, thresholds):
+                    fast_response["fast_decision"] = "accepted"
+                    self.log(
+                        f"白字面板快检放行: frames={len(fast_frames)} "
+                        f"align={float(fast_response.get('alignment', {}).get('score', 0.0)):.2f}"
+                    )
+                    return fast_response
+                self.log(
+                    f"白字面板快检未放行，转严格检测: status={fast_response.get('status', '')} "
+                    f"NG列={','.join(fast_response.get('ng_groups', [])) or '-'}"
+                )
+                extra_count = max(0, frame_count - len(fast_frames))
+                extra_frames = self.capture_frame_sequence(extra_count, interval_ms) if extra_count else []
+                frames = fast_frames + extra_frames
+                if not frames:
+                    raise RuntimeError("没有采集到有效帧")
+                response = self.process_brightness_panel_frames(frames, tag="brightness_station")
+                response["inspection_mode"] = "strict"
+                response["fast_decision"] = "fallback"
+                response["fast_frame_count"] = len(fast_frames)
+                return response
+
             frames = self.capture_frame_sequence(frame_count, interval_ms)
             if not frames:
                 raise RuntimeError("没有采集到有效帧")
-            return self.process_brightness_panel_frames(frames, tag="brightness_station")
+            response = self.process_brightness_panel_frames(frames, tag="brightness_station")
+            response["inspection_mode"] = "strict"
+            return response
+
+    @staticmethod
+    def is_brightness_fast_pass_clear(payload: dict[str, Any], thresholds: dict[str, Any]) -> bool:
+        if not bool(payload.get("overall_ok", False)):
+            return False
+        align_score = float(payload.get("alignment", {}).get("score", 0.0))
+        if align_score < float(thresholds.get("fast_pass_min_alignment", 0.90)):
+            return False
+        if int(payload.get("bad_cell_count", 0)) != 0 or int(payload.get("bad_component_count", 0)) != 0:
+            return False
+        if any(not bool(group.get("ok", False)) for group in payload.get("groups", [])):
+            return False
+        min_relative_mean = float(thresholds.get("fast_pass_min_cell_relative_mean", 0.0))
+        min_relative_area = float(thresholds.get("fast_pass_min_cell_relative_area", 0.0))
+        if min_relative_mean > 0 or min_relative_area > 0:
+            for cell in payload.get("cells", []):
+                if min_relative_mean > 0 and float(cell.get("relative_mean_ratio", 1.0)) < min_relative_mean:
+                    return False
+                if min_relative_area > 0 and float(cell.get("relative_area_ratio", 1.0)) < min_relative_area:
+                    return False
+        return True
 
     @staticmethod
     def max_project_frames(frames: list[np.ndarray]) -> np.ndarray:
@@ -1059,7 +1141,7 @@ class InspectionBackend:
         column_runs = sorted(column_runs, key=lambda run: run[0])
         median_column_width = float(np.median([max(1, run[1] - run[0]) for run in column_runs]))
 
-        cell_templates = self.build_brightness_cell_templates(model, reference, ref_mask)
+        cell_templates = self.get_brightness_cell_templates(model, reference, ref_mask)
         ref_centers = {
             (str(cell["group"]), int(cell["row"])): (
                 float(cell["bbox"][0]) + float(cell["bbox"][2]) / 2.0,
@@ -1424,6 +1506,7 @@ class InspectionBackend:
         ref_mask: np.ndarray,
         geometry_payload: dict[str, Any],
         tag: str,
+        save_result: bool = True,
     ) -> dict[str, Any]:
         thresholds = model.get("thresholds", {})
         lit_gray = float(thresholds.get("lit_gray", thresholds.get("active_gray", 115.0)))
@@ -1440,6 +1523,10 @@ class InspectionBackend:
         min_relative_cell_mean_ratio = float(thresholds.get("min_relative_cell_mean_ratio", 0.0))
         position_baseline_min_group_relative_mean = float(thresholds.get("position_baseline_min_group_relative_mean", 0.0))
         position_baseline_min_group_relative_area = float(thresholds.get("position_baseline_min_group_relative_area", 0.0))
+        column_area_defect_max_group_relative_area = float(thresholds.get("column_area_defect_max_group_relative_area", 0.0))
+        column_area_defect_min_group_relative_mean = float(thresholds.get("column_area_defect_min_group_relative_mean", 0.0))
+        column_area_defect_max_relative_area = float(thresholds.get("column_area_defect_max_relative_area", 0.0))
+        column_area_defect_max_relative_mean = float(thresholds.get("column_area_defect_max_relative_mean", 0.0))
         max_ng_cells_per_group = int(thresholds.get("max_ng_cells_per_group", 0))
         min_panel_median_gray = float(thresholds.get("min_panel_median_gray", 0.0))
         cell_acceptance = thresholds.get("cell_acceptance", {})
@@ -1490,7 +1577,7 @@ class InspectionBackend:
         tilted_acceptance_factor = 1.0 - tilt_ratio * (1.0 - tilt_min_factor)
 
         gray = cv2.cvtColor(projection, cv2.COLOR_BGR2GRAY)
-        cell_templates = self.build_brightness_cell_templates(model, reference, ref_mask)
+        cell_templates = self.get_brightness_cell_templates(model, reference, ref_mask)
         cell_template_by_id = {str(cell["id"]): cell for cell in cell_templates}
         detected_cells = list(geometry_payload.get("cells", []))
         detected_groups = {str(group.get("name", "")): group for group in geometry_payload.get("groups", [])}
@@ -1628,6 +1715,17 @@ class InspectionBackend:
                     and group_relative_area >= position_baseline_min_group_relative_area
                 ):
                     issues = []
+                if (
+                    column_area_defect_max_group_relative_area > 0
+                    and column_area_defect_min_group_relative_mean > 0
+                    and column_area_defect_max_relative_area > 0
+                    and column_area_defect_max_relative_mean > 0
+                    and group_relative_area < column_area_defect_max_group_relative_area
+                    and group_relative_mean >= column_area_defect_min_group_relative_mean
+                    and relative_area_ratio < column_area_defect_max_relative_area
+                    and relative_mean_ratio < column_area_defect_max_relative_mean
+                ):
+                    issues.append(f"列内亮区不足 {group_relative_area:.0%}")
             else:
                 if min_cell_area_ratio > 0 and area_ratio < min_cell_area_ratio:
                     issues.append(f"ROI亮区不足 {area_ratio:.0%}")
@@ -1681,7 +1779,7 @@ class InspectionBackend:
                 ng_groups.append(str(group["name"]))
 
         bad_components: list[dict[str, Any]] = []
-        unit_part_templates = self.build_brightness_unit_part_templates(model, reference, ref_mask, cell_templates)
+        unit_part_templates = self.get_brightness_unit_part_templates(model, reference, ref_mask, cell_templates)
         cell_payload_by_id = {str(cell["id"]): cell for cell in cell_payloads}
         strict_shape_enabled = bool(
             (
@@ -2235,6 +2333,11 @@ class InspectionBackend:
             "thresholds": thresholds,
         }
 
+        response = dict(payload)
+        response["message"] = self.brightness_panel_result_message(payload)
+        if not save_result:
+            return response
+
         result_image = self.draw_brightness_panel_result(projection.copy(), payload, ref_mask)
         run_dir = self.output_dir / datetime.now().strftime(f"%Y%m%d_%H%M%S_{tag}")
         frames_dir = run_dir / "frames"
@@ -2254,15 +2357,14 @@ class InspectionBackend:
             f"grid={payload['alignment']['score']:.2f} NG列={','.join(payload['ng_groups']) or '-'} "
             f"暗亮区={payload['bad_component_count']}"
         )
-        response = dict(payload)
         response["run_dir"] = str(run_dir)
-        response["message"] = self.brightness_panel_result_message(payload)
         return response
 
     def process_brightness_panel_frames(
         self,
         frames: list[np.ndarray],
         tag: str = "brightness_station",
+        save_result: bool = True,
     ) -> dict[str, Any]:
         model, reference = self.get_brightness_panel_model()
         roi = model["roi"]
@@ -2286,6 +2388,7 @@ class InspectionBackend:
                     ref_mask,
                     geometry_payload,
                     tag,
+                    save_result=save_result,
                 )
             x = int(geometry_payload.get("x", x))
             y = int(geometry_payload.get("y", y))
@@ -2385,7 +2488,7 @@ class InspectionBackend:
 
         groups_by_name = {str(group["name"]): group for group in groups_payload}
         cell_payloads: list[dict[str, Any]] = []
-        cell_templates = self.build_brightness_cell_templates(model, reference, ref_mask)
+        cell_templates = self.get_brightness_cell_templates(model, reference, ref_mask)
         ref_kernel = np.ones((5, 5), np.uint8)
         for cell in cell_templates:
             cx, cy, cw, ch = [int(value) for value in cell["bbox"]]
@@ -2451,7 +2554,7 @@ class InspectionBackend:
                     group_payload["ng_cell_count"] = int(group_payload.get("ng_cell_count", 0)) + 1
 
         bad_components: list[dict[str, Any]] = []
-        unit_part_templates = self.build_brightness_unit_part_templates(model, reference, ref_mask, cell_templates)
+        unit_part_templates = self.get_brightness_unit_part_templates(model, reference, ref_mask, cell_templates)
         for part in unit_part_templates:
             cx, cy, cw, ch = [int(value) for value in part["bbox"]]
             if cx < 0 or cy < 0 or cx + cw > ref_mask.shape[1] or cy + ch > ref_mask.shape[0]:
@@ -2545,6 +2648,11 @@ class InspectionBackend:
             "thresholds": thresholds,
         }
 
+        response = dict(payload)
+        response["message"] = self.brightness_panel_result_message(payload)
+        if not save_result:
+            return response
+
         result_image = self.draw_brightness_panel_result(aligned_panel, payload, ref_mask)
         run_dir = self.output_dir / datetime.now().strftime(f"%Y%m%d_%H%M%S_{tag}")
         frames_dir = run_dir / "frames"
@@ -2564,9 +2672,7 @@ class InspectionBackend:
             f"align={align_score:.2f} NG列={','.join(payload['ng_groups']) or '-'} "
             f"暗亮区={payload['bad_component_count']}"
         )
-        response = dict(payload)
         response["run_dir"] = str(run_dir)
-        response["message"] = self.brightness_panel_result_message(payload)
         return response
 
     def draw_brightness_panel_result(
