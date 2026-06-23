@@ -41,6 +41,7 @@ public partial class Form1 : Form
     private bool previewing;
     private bool autoDetecting;
     private bool detecting;
+    private bool previewRefreshing;
     private DateTime resultHoldUntil = DateTime.MinValue;
     private string lastStatusText = "就绪";
 
@@ -696,7 +697,7 @@ public partial class Form1 : Form
 
     private async Task RefreshPreviewAsync()
     {
-        if (!backendReady || detecting)
+        if (!backendReady || previewRefreshing)
         {
             return;
         }
@@ -704,9 +705,10 @@ public partial class Form1 : Form
         {
             return;
         }
+        previewRefreshing = true;
         try
         {
-            if (DateTime.Now < resultHoldUntil)
+            if (!detecting && DateTime.Now < resultHoldUntil)
             {
                 await LoadImageAsync("/result.jpg");
             }
@@ -718,6 +720,10 @@ public partial class Form1 : Form
         catch
         {
             // No frame yet; keep the current display.
+        }
+        finally
+        {
+            previewRefreshing = false;
         }
     }
 
