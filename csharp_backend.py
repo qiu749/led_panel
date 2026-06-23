@@ -1438,6 +1438,8 @@ class InspectionBackend:
         min_cell_mean_ratio = float(thresholds.get("min_cell_mean_ratio", 0.0))
         min_relative_cell_area_ratio = float(thresholds.get("min_relative_cell_area_ratio", 0.0))
         min_relative_cell_mean_ratio = float(thresholds.get("min_relative_cell_mean_ratio", 0.0))
+        position_baseline_min_group_relative_mean = float(thresholds.get("position_baseline_min_group_relative_mean", 0.0))
+        position_baseline_min_group_relative_area = float(thresholds.get("position_baseline_min_group_relative_area", 0.0))
         max_ng_cells_per_group = int(thresholds.get("max_ng_cells_per_group", 0))
         min_panel_median_gray = float(thresholds.get("min_panel_median_gray", 0.0))
         cell_acceptance = thresholds.get("cell_acceptance", {})
@@ -1582,6 +1584,15 @@ class InspectionBackend:
         median_cell_area_ratio = float(np.median([float(cell["area_ratio"]) for cell in cell_payloads])) if cell_payloads else 0.0
         median_cell_mean_ratio = float(np.median([float(cell["mean_ratio"]) for cell in cell_payloads])) if cell_payloads else 0.0
         median_cell_gray = float(np.median([float(cell["mean"]) for cell in cell_payloads])) if cell_payloads else 0.0
+        group_cell_medians: dict[str, tuple[float, float]] = {}
+        for group_name in {str(cell["group"]) for cell in cell_payloads}:
+            group_cells = [cell for cell in cell_payloads if str(cell["group"]) == group_name]
+            if not group_cells:
+                continue
+            group_cell_medians[group_name] = (
+                float(np.median([float(cell["mean_ratio"]) for cell in group_cells])),
+                float(np.median([float(cell["area_ratio"]) for cell in group_cells])),
+            )
         bad_cells: list[dict[str, Any]] = []
         bad_cell_ids: set[str] = set()
         for cell in cell_payloads:
@@ -1603,6 +1614,20 @@ class InspectionBackend:
                     issues.append(f"低于位置基线亮区 {area_ratio:.0%}")
                 if mean_ratio < min_mean:
                     issues.append(f"低于位置基线亮度 {mean_ratio:.0%}")
+                group_median_mean, group_median_area = group_cell_medians.get(str(cell["group"]), (0.0, 0.0))
+                group_relative_mean = mean_ratio / max(group_median_mean, 1e-6)
+                group_relative_area = area_ratio / max(group_median_area, 1e-6)
+                cell["group_relative_mean_ratio"] = round(float(group_relative_mean), 4)
+                cell["group_relative_area_ratio"] = round(float(group_relative_area), 4)
+                if (
+                    issues
+                    and all(issue.startswith("低于位置基线") for issue in issues)
+                    and position_baseline_min_group_relative_mean > 0
+                    and position_baseline_min_group_relative_area > 0
+                    and group_relative_mean >= position_baseline_min_group_relative_mean
+                    and group_relative_area >= position_baseline_min_group_relative_area
+                ):
+                    issues = []
             else:
                 if min_cell_area_ratio > 0 and area_ratio < min_cell_area_ratio:
                     issues.append(f"ROI亮区不足 {area_ratio:.0%}")
